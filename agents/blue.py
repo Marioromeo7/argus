@@ -1,16 +1,13 @@
 """
 ARGUS Layer 5 — Blue Agent
 ============================
-Receives a red agent's engagement plan and uses Qwen3 /think to
-propose concrete mitigations. Writes mitigation nodes and
-mitigates edges to Neo4j, then marks the engagement as closed.
+Receives a red agent's engagement plan, uses Qwen3 /think to propose 
+concrete mitigations, and writes mitigation nodes and mitigates edges 
+to Neo4j. Then marks the engagement as closed.
 
-Co-evolutionary claim: mean_time_to_mitigation decreases over
-successive cycles as blue learns from prior engagements in the graph.
-
-This script is responsible for the blue agent's mitigation planning loop.
-It receives a red agent's attack plan, uses Qwen3 /think to propose
-mitigations, writes mitigation node + mitigates edge to Neo4j,
+This script is the blue agent's mitigation planning loop. 
+It receives a red agent's attack plan, uses Qwen3 /think to propose 
+mitigations, writes mitigation node + mitigates edge to Neo4j, 
 and marks the engagement closed.
 """
 
@@ -146,8 +143,8 @@ def _close_engagement(driver, engagement_id: str) -> None:
 def plan_mitigation(driver, attack_plan: dict, context: dict = None) -> dict:
     """
     ARGUS-LAYER-5: Blue agent mitigation planning loop.
-    Receives a red agent's attack plan, uses Qwen3 /think to propose
-    mitigations, writes mitigation node + mitigates edge to Neo4j,
+    Receives a red agent's engagement plan, uses Qwen3 /think to propose 
+    concrete mitigations, writes mitigation node + mitigates edge to Neo4j, 
     and marks the engagement closed.
     Returns {"status": ..., "mitigation": ...}.
     """
