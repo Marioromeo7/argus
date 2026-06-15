@@ -7,6 +7,11 @@ mitigates edges to Neo4j, then marks the engagement as closed.
 
 Co-evolutionary claim: mean_time_to_mitigation decreases over
 successive cycles as blue learns from prior engagements in the graph.
+
+This script is responsible for the blue agent's mitigation planning loop.
+It receives a red agent's attack plan, uses Qwen3 /think to propose
+mitigations, writes mitigation node + mitigates edge to Neo4j,
+and marks the engagement closed.
 """
 
 import json
