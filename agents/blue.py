@@ -44,7 +44,7 @@ def _mitigation_prompt(engagement: dict) -> str:
     lessons_str  = ("\nPast lessons from prior defenses:\n" +
                     "\n".join(f"- {l}" for l in lessons[:3])) if lessons else ""
     return (
-        "You are the ARGUS Blue Agent responding to an adversarial attack plan.\n\n"
+        "You are the ARGUS Blue Agent responding to an updated adversarial attack plan.\n\n"
         f"Attack chain:\n{chain_str}\n\n"
         f"Attacker confidence: {engagement.get('confidence', 0.5)}\n"
         f"Red reasoning: {engagement.get('reasoning', '')}\n"
