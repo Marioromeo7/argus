@@ -143,9 +143,9 @@ def _close_engagement(driver, engagement_id: str) -> None:
 def plan_mitigation(driver, attack_plan: dict, context: dict = None) -> dict:
     """
     ARGUS-LAYER-5: Blue agent mitigation planning loop.
-    Receives a red agent's engagement plan, uses Qwen3 /think to propose 
-    concrete mitigations, writes mitigation node + mitigates edge to Neo4j, 
-    and marks the engagement closed.
+    Receives a red agent's engagement plan and uses Qwen3 /think to propose 
+    concrete mitigations. Writes mitigation nodes and mitigates edges to 
+    Neo4j. Then marks the engagement as closed.
     Returns {"status": ..., "mitigation": ...}.
     """
     engagement = attack_plan.get("engagement")
