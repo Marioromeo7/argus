@@ -1,0 +1,36 @@
+# ARGUS — Python Dependencies
+# conda activate argus && pip install -r requirements.txt
+
+# Graph database
+neo4j==5.19.0
+
+# Local LLM (Ollama runs as a separate process — this is just the Python client)
+ollama==0.2.1
+
+# Agents & orchestration
+langchain==0.2.6
+langchain-community==0.2.6
+langgraph==0.1.19
+
+# Vector store & embeddings
+chromadb==0.5.3
+
+# Data & utilities
+requests==2.32.3
+python-dotenv==1.0.1
+pydantic==2.7.4
+tenacity==8.3.0
+rich==13.7.1
+
+# MITRE ATT&CK (STIX format)
+stix2==3.0.1
+mitreattack-python==3.0.4
+
+# Evaluation & metrics
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.0
+
+# Dev
+pytest==8.2.2
+ipykernel==6.29.4

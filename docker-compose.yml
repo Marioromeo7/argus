@@ -1,0 +1,18 @@
+services:
+  argus-dashboard:
+    build:
+      context: ./dashboard
+    container_name: argus-dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      - NEO4J_URI=bolt://host.docker.internal:7400
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=argus1234
+    # Allows container to reach Neo4j Desktop running on the host.
+    # On Docker Desktop for Windows/Mac this works natively via host.docker.internal.
+    # On Linux, uncomment the line below instead:
+    # network_mode: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
