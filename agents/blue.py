@@ -56,12 +56,13 @@ def _mitigation_prompt(engagement: dict) -> str:
         "EFFECTIVENESS: <float 0.0-1.0>\n"
         "MITIGATION_STEPS: <semicolon-separated list of concrete defensive actions>\n"
         "PATCH_PRIORITY: <critical|high|medium|low>\n"
-        "REASONING: <one sentence>"
+        "REASONING: <one sentence>\n"
+        "ADDITIONAL_INFO: <any additional information>"
     )
 
 
 def _parse_mitigation(text: str) -> dict:
-    out = {"effectiveness": 0.5, "steps": [], "priority": "medium", "reasoning": ""}
+    out = {"effectiveness": 0.5, "steps": [], "priority": "medium", "reasoning": "", "additional_info": ""}
     for line in text.splitlines():
         if line.startswith("EFFECTIVENESS:"):
             try:
@@ -75,6 +76,8 @@ def _parse_mitigation(text: str) -> dict:
             out["priority"] = line.split(":", 1)[1].strip().lower()
         elif line.startswith("REASONING:"):
             out["reasoning"] = line.split(":", 1)[1].strip()
+        elif line.startswith("ADDITIONAL_INFO:"):
+            out["additional_info"] = line.split(":", 1)[1].strip()
     return out
 
 
@@ -98,6 +101,7 @@ def _write_mitigation_node(driver, mitigation: dict) -> None:
         "source":           "agent_derived",
         "last_updated":     datetime.utcnow().isoformat(),
         "created_at":       datetime.utcnow().isoformat(),
+        "additional_info": mitigation.get("additional_info", "")
     }
     with driver.session() as session:
         session.run(cypher, mid=mitigation["mitigation_id"], props=props)
