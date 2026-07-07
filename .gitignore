@@ -47,3 +47,6 @@ outputs/
 
 # Context bundle (local only)
 argus_context.zip
+
+# Private business docs (local only)
+INVESTOR_BRIEF.md
