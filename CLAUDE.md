@@ -191,15 +191,20 @@ These are the claims the paper makes. The code must prove them:
 
 ## Current Phase
 
-**PHASE 1 — Week 1-2 target:**
-- [ ] Neo4j running locally, connection tested
-- [ ] graph/schema.py — Node and Edge classes with full structure above
-- [ ] graph/ingestion/nvd.py — fetch one CVE from NVD API, write to Neo4j
-- [ ] graph/ingestion/attack.py — load MITRE ATT&CK techniques, write to Neo4j
-- [ ] graph/retrieval.py — basic Cypher query returning nodes by label
-- [ ] scripts/test_ingestion.py — end-to-end smoke test passing
+**v0 — all six layers built, tested, and evaluated locally.** See [CONTEXT.md](CONTEXT.md) for the
+live status, graph stats, and evaluation results, and [PAPER_CLAIMS.md](PAPER_CLAIMS.md) for the
+evidence ledger.
 
-Do NOT start Layer 2 (GraphRAG retrieval) until ingestion smoke test passes.
+Phase 1 (schema + ingestion + retrieval, checklist below) is complete:
+- [x] Neo4j running locally, connection tested
+- [x] graph/schema.py — Node and Edge classes with full structure above
+- [x] graph/ingestion/nvd.py — fetch CVEs from NVD API, write to Neo4j
+- [x] graph/ingestion/attack.py — load MITRE ATT&CK techniques, write to Neo4j
+- [x] graph/retrieval.py — Cypher queries returning nodes by label + traversal
+- [x] scripts/test_ingestion.py — end-to-end smoke test passing
+
+Remaining v0 finalization work is tracked in [BACKLOG.md](BACKLOG.md) (paper draft, hosted demo,
+stronger evaluations). Do not add features outside the six layers without listing them there first.
 
 ---
 

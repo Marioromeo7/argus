@@ -44,3 +44,6 @@ logs/
 results/
 outputs/
 .aider*
+
+# Context bundle (local only)
+argus_context.zip
