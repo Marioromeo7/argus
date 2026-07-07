@@ -138,6 +138,10 @@ The agents write to Neo4j; the dashboard only reads. See [dashboard/](dashboard/
 | [PLAN.md](PLAN.md) | v0 finalization plan and definition of done |
 | [BACKLOG.md](BACKLOG.md) | Out-of-scope work for v0 (production hardening, stronger evals) |
 | [PRODUCT_HOSTING_HANDOFF.md](PRODUCT_HOSTING_HANDOFF.md) | How to ship a safe, read-only public demo |
+| [docs/FINAL_DOD.md](docs/FINAL_DOD.md) | v0 acceptance checklist — what's built, proven, deferred |
+| [docs/EVALUATION_PLAN.md](docs/EVALUATION_PLAN.md) | Plan to strengthen the evaluations (larger samples, significance) |
+| [docs/DEMO_AND_DEPLOY.md](docs/DEMO_AND_DEPLOY.md) | Export script, public-safe dashboard mode, free deployment + demo walkthrough |
+| [docs/PRODUCTION_HARDENING.md](docs/PRODUCTION_HARDENING.md) | Serialization cleanup + auth/tenancy/safety/ops for productization |
 
 ---
 
