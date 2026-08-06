@@ -25,8 +25,10 @@ to replace the live Challenger loop.
 """
 
 import re
+import json
 import math
 import ast
+from datetime import datetime
 import requests as _http
 from graph.retrieval import get_node
 
@@ -377,3 +379,62 @@ def run_narrowing(driver, node_id: str) -> dict:
                 "log": log_by_question,
                 "rounds_detail": rounds_detail,
             }
+
+
+# ── Live wiring (drop-in alternative to agents.challenger.challenge_node) ───────
+
+def _persist(driver, node_id: str, report: dict) -> None:
+    """
+    ARGUS-LAYER-7: Writes a run_narrowing() report to Neo4j in the same shape
+    agents/challenger.py's challenge_node() writes — grain_confidence,
+    open_questions, challenger_log — so this is a genuine drop-in, not a
+    parallel schema. challenger_log entries here are richer than the old
+    format (carry resolved_by/status per THESIS.md's ChallengerLogEntry
+    fields); old-format entries lacking those fields still read fine since
+    they're plain dicts either way.
+    """
+    log = [
+        {
+            "question":    q,
+            "proposal":    r.get("answer_text", ""),
+            "accepted":    r["status"] == "trusted",
+            "resolved_by": r.get("resolved_by", ""),
+            "status":      r["status"],
+            "timestamp":   datetime.utcnow().isoformat(),
+        }
+        for q, r in report["log"].items()
+    ]
+    cypher = """
+    MATCH (n:Node {node_id: $nid})
+    SET n.grain_confidence = $grain,
+        n.open_questions   = $oq,
+        n.challenger_log   = $log,
+        n.last_updated     = $ts
+    """
+    with driver.session() as session:
+        session.run(cypher,
+                    nid=node_id,
+                    grain=report["grain_confidence"],
+                    oq=report["open_questions"],
+                    log=json.dumps(log),
+                    ts=datetime.utcnow().isoformat())
+
+
+def challenge_node_v2(driver, node_id: str) -> dict:
+    """
+    ARGUS-LAYER-7: Drop-in alternative to agents.challenger.challenge_node(),
+    using the asker/answerer narrowing engine (THESIS.md) instead of the
+    self-graded loop. Same persisted fields (grain_confidence, open_questions,
+    challenger_log) so callers can swap this in once validated — the swap is
+    changing an import, not a rewrite.
+
+    NOT wired in as the default. agents.challenger.challenge_node() and
+    run_challenger() are still what the live system calls. The pilot that
+    exercised this code predates the evidence-comparison and empty-answer-
+    guard fixes (see THESIS.md's "Pilot results" section) — do not treat this
+    as validated, or flip it on as the default, until a clean post-fix run
+    confirms it.
+    """
+    report = run_narrowing(driver, node_id)
+    _persist(driver, node_id, report)
+    return report

@@ -9,6 +9,11 @@ on the outcome and logged to challenger_log.
 
 This is the mechanism that makes ARGUS nodes self-aware of what
 they don't know about themselves.
+
+A drop-in alternative exists in agents/narrowing.py (challenge_node_v2) —
+an asker/answerer split instead of this module's self-graded loop, per
+THESIS.md. Not the default yet: unvalidated by a post-bugfix run. See
+THESIS.md before swapping it in.
 """
 
 import re
