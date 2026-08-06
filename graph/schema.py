@@ -29,12 +29,19 @@ class NodeSource(str, Enum):
 
 @dataclass
 class ChallengerLogEntry:
-    """Records a single grain refinement event on a node or edge."""
+    """Records a single grain refinement event on a node or edge.
+
+    ARGUS-LAYER-7 (narrowing thesis): resolved_by and status turn "answered"
+    from a self-graded bool into a sourced, falsifiable claim. See THESIS.md.
+    """
     timestamp:    datetime
     question:     str        # the open question that triggered refinement
     proposal:     str        # what the challenger proposed
     accepted:     bool       # whether the primary agent accepted
     agent_id:     str        # which agent triggered this
+    resolved_by:  str = ""   # "execution:OUT-1234" | "model:mistral:latest" |
+                             # "provenance:<node_id>.<field>" | "" (unresolved)
+    status:       str = "provisional"  # "provisional" | "contested" | "trusted"
 
 
 @dataclass
@@ -168,3 +175,86 @@ class Edge:
         else:
             self.confidence = max(0.0, self.confidence - delta)
         self.last_updated = datetime.utcnow()
+
+
+# ── SCENARIO RUN / OUTCOME (GraphRange, Layer 7) ────────────────────────────────
+
+@dataclass
+class ScenarioRun:
+    """
+    ARGUS-LAYER-7: Records a single GraphRange scenario execution.
+    Written by graphrange/graph_updater.py after each scenario completes.
+    """
+    run_id:           str                        # "RUN-{timestamp}"
+    node_type:        str = "scenario_run"
+    status:           str = "running"            # running|completed|failed|inconclusive
+    cve_ids:          list = field(default_factory=list)
+    technique_ids:    list = field(default_factory=list)
+    tactic_ids:       list = field(default_factory=list)
+    victim_config:    dict = field(default_factory=dict)  # {cpe, os, services, ports}
+    winner:           str  = ""                  # red|blue|stalemate
+    turn_count:       int  = 0
+    duration_seconds: int  = 0
+    created_at:       datetime = field(default_factory=datetime.utcnow)
+    last_updated:     datetime = field(default_factory=datetime.utcnow)
+
+    def to_neo4j(self) -> dict:
+        return {
+            "node_id":          self.run_id,
+            "label":            self.run_id,
+            "node_type":        self.node_type,
+            "status":           self.status,
+            "cve_ids":          self.cve_ids,
+            "technique_ids":    self.technique_ids,
+            "tactic_ids":       self.tactic_ids,
+            "victim_config":    str(self.victim_config),
+            "winner":           self.winner,
+            "turn_count":       self.turn_count,
+            "duration_seconds": self.duration_seconds,
+            "grain_confidence": 0.5,
+            "open_questions":   [],
+            "challenger_log":   "[]",
+            "source":           "graphrange",
+            "created_at":       self.created_at.isoformat(),
+            "last_updated":     self.last_updated.isoformat(),
+        }
+
+
+@dataclass
+class Outcome:
+    """
+    ARGUS-LAYER-7: Records the result of one technique execution in a scenario.
+    Multiple Outcome nodes per ScenarioRun — one per technique attempted.
+    """
+    outcome_id:          str                     # "OUT-{timestamp}-{technique_id}"
+    run_id:              str
+    node_type:           str = "outcome"
+    technique_id:        str = ""
+    cve_id:              str = ""
+    victim_config_hash:  str = ""                # sha256 of str(victim_config)
+    result:              str = "fail"            # success|fail|partial
+    tools_used:          list = field(default_factory=list)
+    observations:        dict = field(default_factory=dict)
+    detected_by_blue:    bool = False
+    created_at:          datetime = field(default_factory=datetime.utcnow)
+
+    def to_neo4j(self) -> dict:
+        return {
+            "node_id":             self.outcome_id,
+            "label":               self.outcome_id,
+            "node_type":           self.node_type,
+            "run_id":              self.run_id,
+            "technique_id":        self.technique_id,
+            "cve_id":              self.cve_id,
+            "victim_config_hash":  self.victim_config_hash,
+            "result":              self.result,
+            "tools_used":          self.tools_used,
+            "observations":        str(self.observations),
+            "detected_by_blue":    self.detected_by_blue,
+            "grain_confidence":    1.0 if self.result == "success" else 0.3,
+            "open_questions":      [],
+            "challenger_log":      "[]",
+            "source":              "graphrange",
+            "created_at":          self.created_at.isoformat(),
+            "last_updated":        self.created_at.isoformat(),
+        }
