@@ -4,6 +4,14 @@
 place to see what is built, what is proven, and what is explicitly deferred. Distinct from
 [PLAN.md](../PLAN.md) (the finalization *plan*) — this is the *acceptance* checklist.
 
+> **Scope note (2026-08-19):** this file's "v0" is the ORIGINAL six-layer prototype
+> (dated by `CONTEXT.md`'s eval timestamps, 2026-05-28/29) and predates GraphRange
+> (Layer 7), the Scanner (Layer 8), and the narrowing-engine (asker/answerer)
+> redesign — all real, mostly-built, and NOT yet validated. Do not read "v0 is
+> done" as "the project is done." Current scope + status lives in
+> [ROADMAP.md](../ROADMAP.md); this file is a historical snapshot, not the live
+> acceptance bar.
+
 Status key: ✅ done · 🟡 partial · ⬜ not started · ⏭️ deferred (tracked in [BACKLOG.md](../BACKLOG.md))
 
 ## 1. Code — the six layers
@@ -38,7 +46,8 @@ Status key: ✅ done · 🟡 partial · ⬜ not started · ⏭️ deferred (trac
 
 ## 4. Deferred to post-v0 (not blocking)
 
-- ⏭️ Research paper prose draft (outline only) — md framing is sufficient for now
+- ✅ Research paper prose draft — `PAPER_DRAFT.md` (2026-08-17), architecture +
+      methods complete, results transcribed from the ledger. No longer outline-only.
 - ⏭️ Stronger evaluations → [EVALUATION_PLAN.md](EVALUATION_PLAN.md)
 - ⏭️ Public read-only demo → [DEMO_AND_DEPLOY.md](DEMO_AND_DEPLOY.md)
 - ⏭️ Production hardening → [PRODUCTION_HARDENING.md](PRODUCTION_HARDENING.md)

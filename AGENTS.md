@@ -191,15 +191,33 @@ These are the claims the paper makes. The code must prove them:
 
 ## Current Phase
 
-**PHASE 1 — Week 1-2 target:**
-- [ ] Neo4j running locally, connection tested
-- [ ] graph/schema.py — Node and Edge classes with full structure above
-- [ ] graph/ingestion/nvd.py — fetch one CVE from NVD API, write to Neo4j
-- [ ] graph/ingestion/attack.py — load MITRE ATT&CK techniques, write to Neo4j
-- [ ] graph/retrieval.py — basic Cypher query returning nodes by label
-- [ ] scripts/test_ingestion.py — end-to-end smoke test passing
+> **CORRECTED 2026-08-19 — this section was frozen at the literal project
+> start** (an unchecked Phase-1 checklist) while the real repo moved through
+> v0 completion, the GraphRange cyber range (Layer 7), the Scanner (Layer 8),
+> and a narrowing-engine redesign — none of that was ever reflected here. If
+> you are an agent reading this file as the project rulebook: **do not trust
+> the stale text below on its own** — read [ROADMAP.md](ROADMAP.md) first,
+> which is the live, decision-oriented master list.
 
-Do NOT start Layer 2 (GraphRAG retrieval) until ingestion smoke test passes.
+**v0 — all six layers built, tested, and evaluated locally.** See
+[CONTEXT.md](CONTEXT.md) for the live status, graph stats, and evaluation
+results, and [PAPER_CLAIMS.md](PAPER_CLAIMS.md) for the evidence ledger.
+
+Phase 1 (schema + ingestion + retrieval, checklist below) is complete:
+- [x] Neo4j running locally, connection tested
+- [x] graph/schema.py — Node and Edge classes with full structure above
+- [x] graph/ingestion/nvd.py — fetch CVEs from NVD API, write to Neo4j
+- [x] graph/ingestion/attack.py — load MITRE ATT&CK techniques, write to Neo4j
+- [x] graph/retrieval.py — Cypher queries returning nodes by label + traversal
+- [x] scripts/test_ingestion.py — end-to-end smoke test passing
+
+Beyond v0: GraphRange (Layer 7, Docker cyber range) and the Scanner (Layer 8)
+are largely built and zero-GPU-verified but not yet live-validated; the
+narrowing engine (`agents/narrowing.py`) is a coded, opt-in redesign of the
+challenger, also not yet post-fix-validated. **[ROADMAP.md](ROADMAP.md)** is
+the current source of truth for what's done vs. open — this file and
+[CLAUDE.md](CLAUDE.md) are the durable rulebook (schema, layer order, model
+rules), not the live status tracker.
 
 ---
 

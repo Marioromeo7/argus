@@ -34,3 +34,20 @@ scikit-learn==1.5.0
 # Dev
 pytest==8.2.2
 ipykernel==6.29.4
+
+# GraphRange additions
+docker==7.1.0          # Docker SDK for Python (supervisor container management)
+flask==3.0.3           # Supervisor HTTP API (lightweight, no langchain)
+beautifulsoup4==4.12.3 # Tool crawler HTML parsing (Kali tools listing)
+
+# Narrowing engine — clause splitting (CPU-only, not a model call)
+spacy==3.7.5
+# after installing: python -m spacy download en_core_web_sm
+
+# GraphRange Scanner additions
+psutil==7.2.2   # telemetry.py CPU/RAM sampling (already present, pinning the
+                # real installed version rather than the spec's 5.9.8 guess)
+tiktoken==0.7.0 # telemetry.py real token counting
+reportlab==4.1.0 # scanner_report.py PDF generation
+pyyaml==6.0.3    # victim_builder.py compose file parsing (already present,
+                 # pinning the real installed version)

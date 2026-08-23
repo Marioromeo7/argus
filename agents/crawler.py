@@ -12,15 +12,16 @@ brings back knowledge, transformed for the graph's schema.
 
 import json
 import os
+import time
 import requests as _http
 from datetime import datetime
-import ollama
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from graph.schema import Edge, NodeSource
 from graph.retrieval import get_node
 from graph.ingestion.nvd import fetch_cves, cve_to_node
 from agents.challenger import assess_proposal
+from config import OLLAMA_CHAT_URL
 
 load_dotenv()
 
@@ -71,9 +72,10 @@ def _write_node(driver, node_dict: dict, label: str) -> None:
 
 # ── Entity extraction ─────────────────────────────────────────────────────────
 
-def _extract_entities(text: str) -> dict:
+def _extract_entities(text: str, max_retries: int = 3) -> dict:
     """ARGUS-LAYER-4: Extract ATT&CK technique IDs and vuln type from text.
-    Uses Ollama HTTP API with think=False to skip reasoning tokens (~44s vs ~265s)."""
+    Uses Ollama HTTP API with think=False to skip reasoning tokens (~44s vs ~265s).
+    Retries on Cloudflare 524 with exponential backoff."""
     prompt = (
         f"Extract cybersecurity entities from this text.\n\n"
         f"Text: {text[:800]}\n\n"
@@ -81,27 +83,27 @@ def _extract_entities(text: str) -> dict:
         "TECHNIQUES: <comma-separated ATT&CK IDs like T1059 or NONE>\n"
         "VULN_TYPE: <one category like heap_overflow, sql_injection, auth_bypass or NONE>"
     )
-    try:
-        r = _http.post(
-            "http://localhost:11434/api/chat",
-            json={
-                "model": MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "think": False,
-                "stream": False,
-            },
-            timeout=120,
-        )
-        r.raise_for_status()
-        content = r.json().get("message", {}).get("content", "")
-    except Exception:
-        # Fallback to ollama library if HTTP call fails
-        resp = ollama.chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": f"/no_think\n\n{prompt}"}],
-        )
-        content = resp["message"]["content"]
-    return _parse_entities(content)
+    for attempt in range(max_retries):
+        try:
+            r = _http.post(
+                OLLAMA_CHAT_URL,
+                json={
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "think": False,
+                    "stream": False,
+                },
+            )  # no timeout — let Kaggle inference run as long as needed
+            r.raise_for_status()
+            content = r.json().get("message", {}).get("content", "")
+            return _parse_entities(content)
+        except _http.exceptions.HTTPError as e:
+            if e.response.status_code == 524 and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 30
+                print(f"  [RETRY] Cloudflare timeout on attempt {attempt+1}/{max_retries}, waiting {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
 
 
 def _parse_entities(text: str) -> dict:

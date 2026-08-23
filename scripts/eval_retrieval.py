@@ -21,10 +21,30 @@ Usage:
     python scripts/eval_retrieval.py
 """
 
-import sys, os, re, time, json
+import sys, os, re, time, json, argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Defensive: this Windows environment's stdout defaults to cp1252 when
+# redirected/piped (confirmed live 2026-08-19 -- a plain "->" arrow crashed
+# with UnicodeEncodeError; fixed at that call site, but a many-hour unattended
+# run (R2.1 at real scale) dying hours in on some future incidental non-ASCII
+# character, e.g. from live NVD text, would be a real waste). errors='replace'
+# degrades gracefully (prints '?') instead of crashing the whole run.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 import chromadb
+# config must import before ollama -- the `ollama` package reads OLLAMA_HOST
+# once at import time to build its default client. On this machine OLLAMA_HOST
+# is already set as a persistent OS env var (0.0.0.0:11434, by the native
+# Ollama installer) which is valid to BIND to but not to CONNECT to
+# (WinError 10049) -- config.py forces it to the real, connectable value as an
+# import-time side effect. Same fix already applied to agents/red.py, blue.py,
+# challenger.py, memory/reflexion.py (2026-08-12); this script never got it
+# because it calls ollama.embeddings() directly instead of going through
+# agents/narrowing.py's HTTP-based (config-safe) embedding call. Found live
+# 2026-08-19 hitting exactly this crash trying to verify the R2.1 changes.
+import config  # noqa: F401
 import ollama
 import numpy as np
 from dotenv import load_dotenv
@@ -239,7 +259,20 @@ def _metrics(retrieved: set, ground_truth: set) -> dict:
 
 # ── Main eval ─────────────────────────────────────────────────────────────────
 
-def run_eval(k: int = 10) -> dict:
+def run_eval(k: int = 10, n_cves: int = 10) -> dict:
+    """
+    ROADMAP R2.1 (2026-08-19): n_cves was hardcoded to 10 via a fixed `LIMIT 10`
+    in the Cypher below -- made it a real parameter so a >=50-CVE run (the
+    actual R2.1 target) is possible at all. Cypher's LIMIT is safe against a
+    pool smaller than requested (returns what exists, no error) -- but whether
+    the graph currently HAS >=50 CVEs with a technique edge at all is unverified
+    from here (Bash/Neo4j access blocked this session by the safety classifier);
+    check `evaluable_cves`/`total_test_cves` in the printed summary before
+    trusting a >=50 claim. The fuller R2.1 spec (P@k for k in {5,10,20}, MRR,
+    nDCG@10, bootstrap 95% CIs on the delta) is NOT implemented here -- those
+    need ranked (not set) retrieval results and untested statistical code is
+    worse than none; left as explicit follow-up, not guessed at blind.
+    """
     from graph.retrieval import get_driver
     driver = get_driver()
 
@@ -249,7 +282,8 @@ def run_eval(k: int = 10) -> dict:
             "MATCH (v:Node {node_type: 'vulnerability'})-[:RELATION]->"
             "(t:Node {node_type: 'technique'}) "
             "WITH v, count(t) AS tc WHERE tc >= 1 "
-            "RETURN v.node_id AS cve_id ORDER BY tc DESC LIMIT 10"
+            "RETURN v.node_id AS cve_id ORDER BY tc DESC LIMIT $n_cves",
+            n_cves=n_cves,
         ))
     test_cves = [r["cve_id"] for r in rows]
 
@@ -269,7 +303,7 @@ def run_eval(k: int = 10) -> dict:
         gt = _nvd_ground_truth(driver, cve_id)
         gt_map[cve_id] = gt
         sources = _nvd_technique_candidates(cve_id)
-        print(f"  {cve_id}: NVD candidates={sources or '{}'} → "
+        print(f"  {cve_id}: NVD candidates={sources or '{}'} -> "
               f"graph-intersected GT={gt or '{}'}")
         time.sleep(0.4)
 
@@ -285,6 +319,7 @@ def run_eval(k: int = 10) -> dict:
         return {}
 
     graphrag_scores, vector_scores = [], []
+    retrieved_map: dict[str, dict] = {}  # cve_id -> {"graphrag": set, "vector": set}
     header = (f"\n{'CVE':<22} {'GT':>4} {'Method':<12} "
               f"{'P@K':>6} {'Recall':>8} {'FPR':>7} {'TP/FP/FN'}")
     print(header)
@@ -293,6 +328,7 @@ def run_eval(k: int = 10) -> dict:
     for cve_id, gt in evaluable.items():
         g_ret = _graphrag_retrieve(driver, cve_id, k=k)
         v_ret = _vector_retrieve(col, driver, cve_id, k=k)
+        retrieved_map[cve_id] = {"graphrag": g_ret, "vector": v_ret}
         g_m   = _metrics(g_ret, gt)
         v_m   = _metrics(v_ret, gt)
         graphrag_scores.append(g_m)
@@ -336,11 +372,16 @@ def run_eval(k: int = 10) -> dict:
         "vector_fpr":          v_fpr,
         "delta_precision":     delta,
         "per_cve": {
+            # R2.1 fix (2026-08-19): previously always [] -- a dead
+            # `if False else []` branch tried to re-call _graphrag_retrieve()
+            # with no arguments AFTER the driver was already closed, which
+            # would have raised if it had ever actually run. Now captured
+            # live inside the scoring loop above (retrieved_map), while the
+            # driver is still open, instead of a broken post-hoc re-fetch.
             cve_id: {
-                "ground_truth":      sorted(gt),
-                "graphrag_retrieved": sorted(_graphrag_retrieve(
-                    # re-open for final capture (already closed above — skip recompute)
-                )) if False else [],
+                "ground_truth":       sorted(gt),
+                "graphrag_retrieved": sorted(retrieved_map[cve_id]["graphrag"]),
+                "vector_retrieved":   sorted(retrieved_map[cve_id]["vector"]),
             }
             for cve_id, gt in evaluable.items()
         },
@@ -360,14 +401,24 @@ def _report_no_gt(driver, col, test_cves: list, k: int) -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n-cves", type=int, default=10,
+                        help="Number of candidate CVEs to pull from the graph "
+                             "(R2.1 target: >=50; default 10 matches the "
+                             "original pilot sample)")
+    parser.add_argument("--k", type=int, default=10, help="Retrieval depth")
+    parser.add_argument("--output", type=str, default="results/eval1_final.json")
+    args = parser.parse_args()
+
     print("=" * 75)
     print("ARGUS Eval 1 — Retrieval Precision (GraphRAG vs VectorRAG)")
     print("Ground truth: NVD CWE IDs + ATT&CK reference URLs + keywords")
-    print("(Builds nomic-embed-text index + NVD API calls — expect ~3-5 min)")
+    print(f"(n_cves={args.n_cves}, k={args.k} — builds nomic-embed-text index + "
+          f"NVD API calls, budget scales with n_cves)")
     print("=" * 75)
-    result = run_eval(k=10)
+    result = run_eval(k=args.k, n_cves=args.n_cves)
     if result:
         os.makedirs("results", exist_ok=True)
-        with open("results/eval1_final.json", "w") as f:
+        with open(args.output, "w") as f:
             json.dump(result, f, indent=2)
-        print("\nResults saved to results/eval1_final.json")
+        print(f"\nResults saved to {args.output}")

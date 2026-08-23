@@ -14,25 +14,46 @@ import json
 import re
 import os
 from datetime import datetime
-import ollama
+import config  # noqa: F401 -- side effect: forces OLLAMA_HOST. Must import
+                # before `ollama` -- that package reads OLLAMA_HOST once at
+                # import time to build its default client, so importing
+                # config afterward was too late (confirmed live: WinError
+                # 10049, connecting to the stale pre-existing system value).
+import requests
 from dotenv import load_dotenv
 from graph.retrieval import get_node
 
 load_dotenv()
 
+import time
+
 MODEL = "qwen3:8b"
+EXEC_TIMEOUT = 60  # seconds, per GRAPHRANGE.md Phase 4 spec
+OLLAMA_CHAT_URL = f"{os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')}/api/chat"
 
 
 # ── LLM helper ────────────────────────────────────────────────────────────────
 
-def _think(prompt: str) -> str:
-    """Call Qwen3 in thinking mode; strip <think> blocks from output."""
-    resp = ollama.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": f"/think\n\n{prompt}"}],
-    )
-    text = resp["message"]["content"]
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+def _think(prompt: str, max_retries: int = 3) -> str:
+    """Call Qwen3 in thinking mode; strip <think> blocks from output.
+    Retries on Cloudflare 524 (origin timeout) with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(OLLAMA_CHAT_URL, json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": f"/think\n\n{prompt}"}],
+                "stream": False,
+            })  # no timeout — let Kaggle inference run as long as needed
+            r.raise_for_status()
+            text = r.json()["message"]["content"]
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 524 and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 30  # 30s, 60s, 120s
+                print(f"  [RETRY] Cloudflare timeout on attempt {attempt+1}/{max_retries}, waiting {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
 
 
 # ── Graph queries ─────────────────────────────────────────────────────────────
@@ -164,15 +185,33 @@ def update_chain_confidence(driver, chain: list, succeeded: bool) -> None:
 
 # ── Main entrypoint ───────────────────────────────────────────────────────────
 
-def plan_attack(driver, context: dict = None, max_chains: int = 5) -> dict:
+def plan_attack(driver, context: dict = None, max_chains: int = 5,
+                scenario: dict = None) -> dict:
     """
     ARGUS-LAYER-5: Red agent attack planning loop.
     Finds CVE->technique->tactic chains, uses Qwen3 /think to select
     the best path, writes an engagement node to Neo4j.
     Returns {"status": ..., "engagement": ..., "all_chains": ...}.
+
+    When `scenario` (from get_valid_scenarios()) is given, planning is TARGETED
+    at it (GraphRange Phase 7, D5): the scenario's own CVE is seeded first so its
+    CVE->technique->tactic chain is a candidate, and the target is surfaced in
+    the plan prompt -- closing the "what red planned vs. what execute_attack
+    measures can diverge" gap. run_scenario.run_one() re-verifies the match
+    after execution. With scenario=None the original independent whole-surface
+    behavior is unchanged (Layer 5 co-evolution use).
+
+    NOTE: the scenario-targeting path is not yet live-validated -- added
+    file-only 2026-08-17; needs the Phase 7 GPU run to confirm.
     """
     if context is None:
         context = {}
+
+    target = None
+    if scenario and scenario.get("cve_id"):
+        target = {"cve_id": scenario.get("cve_id"),
+                  "technique_id": scenario.get("technique_id")}
+        context = {**context, "target_scenario": target}
 
     # Load red agent's past lessons to improve chain selection over cycles
     try:
@@ -185,13 +224,23 @@ def plan_attack(driver, context: dict = None, max_chains: int = 5) -> dict:
         pass
 
     surface = _get_attack_surface(driver)
-    if not surface:
+    if not surface and not target:
         return {"status": "no_attack_surface", "chains": [], "plan": None}
 
+    # Seed the target scenario's CVE first (so its chain is a candidate the
+    # LLM can select), then fill from the broader attack surface.
+    seed_cves = []
+    if target:
+        seed_cves.append(target["cve_id"])
+    seed_cves.extend(entry["cve_id"] for entry in surface[:3])
+
     all_chains = []
-    for entry in surface[:3]:
-        chains = _get_full_chains(driver, entry["cve_id"])
-        all_chains.extend(chains)
+    seen_cves = set()
+    for cve_id in seed_cves:
+        if cve_id in seen_cves:
+            continue
+        seen_cves.add(cve_id)
+        all_chains.extend(_get_full_chains(driver, cve_id))
         if len(all_chains) >= max_chains:
             break
 
@@ -211,6 +260,7 @@ def plan_attack(driver, context: dict = None, max_chains: int = 5) -> dict:
         "confidence":     plan["confidence"],
         "reasoning":      plan["reasoning"],
         "preconditions":  plan["preconditions"],
+        "target_scenario": target,
         "context":        context,
         "timestamp":      datetime.utcnow().isoformat(),
         "status":         "open",
@@ -220,3 +270,92 @@ def plan_attack(driver, context: dict = None, max_chains: int = 5) -> dict:
     print(f"  [RED] {engagement_id} — {len(selected_chain)}-hop chain, "
           f"confidence={plan['confidence']:.2f}")
     return {"status": "planned", "engagement": engagement, "all_chains": all_chains}
+
+
+# ── Execution layer (GraphRange, Layer 7) ───────────────────────────────────────
+
+def _map_observables_to_capability(observables: list) -> str:
+    """ARGUS-LAYER-7: Rough mapping from a technique's expected_observables to
+    a tool capability category the tool graph understands. Deliberately a
+    small hardcoded rule set, not a model call — this is a coarse routing
+    decision (which capability bucket to search), not a judgment worth
+    spending GPU on."""
+    text = " ".join(observables).lower()
+    if any(k in text for k in ("credential", "password_hash", "password")):
+        return "credential_access"
+    if any(k in text for k in ("file_path", "registry_key")):
+        return "discovery"
+    if any(k in text for k in ("shell_access", "command_output")):
+        return "exploitation"
+    return "network_scanning"
+
+
+def execute_attack(driver, supervisor_url: str, scenario: dict, engagement: dict) -> dict:
+    """
+    ARGUS-LAYER-7: Executes a planned attack in the Docker range. Called
+    AFTER plan_attack() returns an engagement. Fails gracefully at every
+    supervisor call — a Docker range being down should never crash the
+    calling scenario loop.
+
+    Real command construction is intentionally simple: `{tool} [json_flag]
+    {target}`. This covers common CLI tools (nmap-shaped) but not every
+    tool's actual argument order — a known simplification, not a claim of
+    universal tool support.
+    """
+    from graphrange.tool_graph import get_tool_by_name
+    from graphrange.observer import normalize, determine_success
+
+    run_suffix = scenario.get("run_id") or engagement.get("engagement_id", "adhoc")
+    red_container = f"gr-red-{run_suffix}"
+    victim_container = f"gr-victim-{run_suffix}"
+
+    capability = _map_observables_to_capability(scenario.get("expected_observables", []))
+    try:
+        resp = requests.post(f"{supervisor_url}/tool_request",
+                              json={"agent": "red", "capability": capability},
+                              timeout=EXEC_TIMEOUT)
+        resp.raise_for_status()
+        tool_info = resp.json()
+    except requests.RequestException:
+        return {"status": "supervisor_error"}
+
+    tool_name = tool_info.get("tool_name")
+    if not tool_name:
+        return {"status": "no_tool_available", "capability": capability}
+    install_command = tool_info.get("install_command")
+
+    try:
+        if install_command:
+            resp = requests.post(f"{supervisor_url}/exec",
+                                  json={"container": red_container, "command": install_command},
+                                  timeout=EXEC_TIMEOUT)
+            resp.raise_for_status()
+            if not resp.json().get("success", False):
+                return {"status": "install_failed", "tool_used": tool_name,
+                        "install_command": install_command}
+
+        tool_props = get_tool_by_name(driver, tool_name)
+        props = (tool_props or {}).get("properties", {})
+        if props.get("supports_json_output") and props.get("json_flag"):
+            run_command = f"{tool_name} {props['json_flag']} {victim_container}"
+        else:
+            run_command = f"{tool_name} {victim_container}"
+
+        resp = requests.post(f"{supervisor_url}/exec",
+                              json={"container": red_container, "command": run_command},
+                              timeout=EXEC_TIMEOUT)
+        resp.raise_for_status()
+        stdout = resp.json().get("stdout", "")
+    except requests.RequestException:
+        return {"status": "supervisor_error"}
+
+    observations = normalize(stdout, scenario.get("technique_id", ""), driver)
+    success = determine_success(observations, scenario)
+
+    return {
+        "status": "executed",
+        "tool_used": tool_name,
+        "raw_output": stdout,
+        "observations": observations,
+        "success": success,
+    }

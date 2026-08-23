@@ -304,6 +304,250 @@ graph writes). Full reports in `results/narrowing_pilot.jsonl`.
 
 ---
 
+## Truncation fix and the comma-dilution gap (2026-08-09/10)
+
+Two sessions after the pilot above, real validation runs finally landed (the per-clause
+verification gate — clause splitting, entity/term-overlap checking, `spawned_questions` for
+unsupported clauses — was designed and built in between, replacing the whole-answer similarity
+check discussed in the pilot section; not documented here yet, see `agents/narrowing.py` directly).
+Two more real findings:
+
+- **97% of ATT&CK technique descriptions were silently truncated at ingestion.**
+  `graph/ingestion/attack.py` hard-capped `description` at `[:500]` characters with no comment
+  explaining why (traced via `git log` to the very first commit that added the file — no prior
+  untruncated version existed). Real corpus check via the `mitreattack` API: full descriptions run
+  207-4680 chars, median 1298, and 674 of 697 techniques (97%) exceed 500. A live audit of every
+  hedge (`COMMITS=no`) question against real source text showed most hedges were the answerer
+  correctly declining to fabricate content that had literally been cut off mid-sentence
+  (`"(Citati"`, `"<cod"`, `"...suc"`) — not the mechanism failing, the mechanism correctly refusing
+  to guess past a truncation boundary. Fixed: removed `[:500]` on both tactic and technique
+  descriptions, re-ingested all 697 techniques, and pinned `num_ctx=4096` on both the asker and
+  answerer calls (neither had ever set it explicitly — harmless while every prompt was ~130 tokens,
+  worth pinning now that some prompts jump to ~1200 tokens of description alone, on a 4GB card
+  where the KV cache competes with everything else). Smoke test on `T1055.011` confirmed real
+  improvement: `grain_confidence` 0.675 → 0.8125, trusted answers 3→7 of 12, no GPU
+  oversubscription (peaked ~2377 MiB of 4096).
+
+- **A perfect `grain_confidence = 1.0` on `T1053.005` (6/6 trusted) turned out to be inflated —
+  found by refusing to trust a suspiciously clean number, same as an earlier suspiciously clean
+  zero.** Manual audit of all 6 "trusted" answers against the real source text: 3 were genuinely
+  faithful restatements, but 3 contained real problems the gate should have caught:
+  1. *"...conduct remote execution as part of lateral movement **by** running a process under a
+     specified account, such as SYSTEM."* — source states these as two separate, unconnected abuse
+     patterns (`"...and/or..."`); the model invented the causal link.
+  2. *"...for **privilege escalation**."* — that phrase never appears in the cited `description`
+     field at all; the model appears to have pulled it from the node's separate `tactics` list
+     (which does include `privilege-escalation`) and asserted it as if the cited field said so.
+  3. *"...**without requiring user interaction**."* — flatly fabricated; the source never
+     addresses user interaction.
+
+  Root cause: `_split_clauses()` only splits on `, and/but/while/whereas` or `;` — it does not
+  split on bare commas or trailing purpose/manner phrases (`"for X"`, `"without Y"`). Each
+  fabrication above rides as a short tail on an otherwise-faithful, longer sentence, so it gets
+  checked as part of one large clause instead of in isolation — enough of the sentence's other
+  salient terms genuinely match the source that the 60% term-overlap threshold still clears despite
+  the tail being unsupported or invented. This is the same *bundled-claim confabulation* failure
+  mode the per-clause gate was built to close, resurfacing in a syntactic shape (comma-appended
+  trailing phrases, not conjunctions) the splitter regex doesn't cover. **Not yet fixed** — found
+  mid-run on the full 8-node v3 chain; per standing practice this session, the fix is deferred to
+  after the chain completes rather than interrupting an in-flight run.
+  - Fix direction (not yet implemented): broaden `_split_clauses()` to also split on trailing
+    prepositional/purpose phrases (`", for "`, `", without "`, `" without "`, `" for the purpose
+    of "` etc.), or move to a stricter unit than regex-split sentences — e.g. requiring every
+    independently-checkable noun phrase within a clause to individually clear the containment
+    check, not just the clause's aggregate ratio.
+
+**Update, same session — fixed and verified, plus two more bugs found the same way.** Continued
+auditing every node as it landed rather than trusting the number, per the user's own standard
+("are you sure that's a consistent mistake without reading?" — applied to a suspiciously *good*
+0.32 exactly as rigorously as the suspicious 1.0). Found two more real, distinct bugs this way,
+neither a repeat of the dilution pattern:
+
+- **`T1560.001` (`0.0`) was unauditable, not provably wrong.** `_unanswered()` always set
+  `answer_text=""`, discarding whatever the model actually claimed even when it was rejected —
+  no way to tell a correct rejection from a false negative without a live re-query. Fixed: added
+  an `attempted` parameter, threaded through every call site in `answer()`.
+- **`T1021.005`: a compound `EVIDENCE` citation broke field lookup.** The model cited two fields
+  at once (`"T1021.005:platforms, T1021.005:description"`); `partition(":")` on the whole string
+  left `cite_field = "platforms, T1021.005:description"` — a garbage key that read back empty,
+  producing the misleading reason *"cited field ... is empty"* when the real field had 1449 real
+  characters. Fixed: take only the first citation (matching what the prompt actually asks for —
+  one citation per answer); checking against the union of multiple cited fields is a possible
+  future improvement, not built now.
+
+**The dilution fix landed as regex+spaCy union, not regex alone**, per the same skepticism —
+"is regex really the answer?" was the right question, and the honest answer was no: regex
+clause-splitting is a syntactic proxy for a semantic boundary question, and the first fix already
+had a second failure mode by the time it was audited. Before wiring anything in: fetched the real
+Kali... no — fetched the real MITRE description text and ran spaCy's dependency parse against the
+exact 5 fabricated sentences found via audit. Result: 4 of 5 fabricated tails isolate cleanly as
+distinct `prep`/`advcl`/`mark` subtrees (the ones riding on a purpose/reason/exception phrase —
+"for X", "without Y", "since Z", "in order to W"). One (`"...by running a process under...
+SYSTEM"` — an invented causal link between two independently-true facts) isolates syntactically
+but wouldn't be caught by splitting alone, since both resulting fragments are individually true;
+that's a structurally different bug (relationship fabrication, not tail fabrication) that neither
+regex nor spaCy nor word-overlap fully closes — logged honestly, not fixed by pretending clause
+splitting solves everything.
+
+Implementation: `_split_clauses()` now unions the existing regex split (sentence boundaries,
+`and`/`but`/`while`/`whereas`, semicolons) with spaCy-identified boundaries — `mark` tokens always
+split (that dependency relation *is* "this starts a subordinate clause"), `prep` tokens split
+only when the preposition is in a curated purpose/manner/exception set (`for`, `without`, `by`,
+`despite`, `except`, `unless`) attached directly to a verb — deliberately narrow so structural
+prepositions ("under X", "of Y") don't over-fragment the core claim. Both are pure CPU/text
+operations (`spacy` + `en_core_web_sm`, no GPU, no Ollama call) — verified before trusting it:
+unit-tested against all 4 real fabricated sentences (all now correctly isolated and rejected in
+isolation) and regression-tested against every genuinely clean answer found tonight (no
+regressions once the full real source-field text was used instead of a hand-picked excerpt — the
+first "regression" was a test-setup artifact, not a real one).
+
+Not yet done: a live end-to-end smoke test with all three fixes active (unit tests only so far,
+deliberately — no concurrent Ollama calls while the v3 chain has the GPU). That's the next step
+once the chain finishes, before trusting any new confidence number these fixes produce.
+
+## Recalibration methodology (design only — not run, a decision queued for later)
+
+`ALPHA`, `BETA`, `EVIDENCE_SIMILARITY_THRESHOLD`, and the 0.6 term-overlap ratio in
+`_clause_supported()` have all been unvalidated guesses since the pilot. Drafting the actual
+approach now, ahead of having trustworthy data to run it against, so the method itself gets
+scrutinized before any numbers do.
+
+The four constants don't have the same calibration problem, and shouldn't be treated as one:
+
+- **Term-overlap ratio (0.6) and `EVIDENCE_SIMILARITY_THRESHOLD`** are genuinely calibratable
+  against `results/narrowing_gate_labeled_audit.jsonl` — for every labeled (clause, source,
+  verdict) triple, compute the actual overlap ratio / embedding similarity, then sweep candidate
+  thresholds and pick the one maximizing precision on the "bad" class (false "trusted" is worse
+  than a missed "good" one here, given the whole point of the redesign is not overclaiming — so
+  precision matters more than recall, and the sweep should say so explicitly rather than defaulting
+  to F1). This only works once the labeled set is big enough to trust a sweep on — 15 examples
+  isn't there yet; needs growing alongside every future audit, not just this session's.
+
+- **`ALPHA`/`BETA` (the node-level confidence formula) don't have an equivalent ground truth.**
+  There's no labeled "T1053.005's true confidence is X" to fit against — that number doesn't
+  exist independent of the formula itself. Point-calibrating them the same way as the thresholds
+  above would be false precision. The honest alternative: a sensitivity analysis, not a fit — run
+  the formula across a small grid of ALPHA/BETA values against real node data, and check whether
+  the *relative ranking* of nodes (which ones are more/less confident than which others) stays
+  stable across that grid. Calibrate for ranking stability, not for hitting an absolute target
+  that was never real. Write this distinction into the paper explicitly — presenting ALPHA/BETA
+  as equally "calibrated" as the thresholds above would overclaim rigor that doesn't exist.
+
+Not started — logged here so the method is on record before any numbers are, and so running it
+is a decision made on purpose, not a default reflex once trustworthy data exists.
+
+## Sixth real bug — found auditing the v4 (all-fixes-active) run itself, 2026-08-10
+
+Continuing to audit every node after the three fixes landed, rather than treating them as "done"
+once verified in isolation, surfaced a fourth, unrelated bug. `T1055.011` (v4) landed at
+`grain_confidence=0.3`, down from v3's `0.8125` — a big enough drop to warrant checking rather
+than assuming the fixes explain it. One of the six `trusted` answers claimed EWM injection
+*"differs from other memory injection techniques like APC injection and thread hijacking"* —
+neither "APC injection" nor "thread hijacking" appears anywhere in the source; the model asserted
+a comparison it had no basis for. It should have been caught and wasn't.
+
+Root cause, confirmed with a clean side-by-side test: `_salient_terms()` never deduplicates.
+The clause repeats "injection" three times (it's the technique's own name, appears in nearly
+every sentence of the source). Raw ratio: 8/13 = 61.5%, passes the 0.6 threshold. Deduplicated
+ratio: 6/11 = 54.5%, correctly fails. The repeated word pads both the numerator and denominator
+enough to flip a genuinely-failing clause into a passing one — a distinct mechanism from the
+dilution bug (that was about clause *boundaries*; this is about term *counting* within an
+already-correctly-isolated clause).
+
+**Fixed and verified, 2026-08-10, while the v4 chain kept running.** Editing the file while a
+chain is actively running was already established as safe — an already-started process doesn't
+hot-reload the module (confirmed earlier when a v3 node ran on pre-fix code despite the fix
+already being on disk), so the fix could be written and unit-tested in parallel without touching
+the live chain's outcome, same pattern as building GraphRange Phase 1 during the v3 chain. Only a
+*live* smoke test (a real Ollama call) would have contended for GPU — the fix and its tests don't
+need one.
+
+Fix: deduplicate terms before computing the overlap ratio in `_clause_supported()`. Verified
+against the exact real fabrication (`"EWM injection...APC injection...thread hijacking"` now
+correctly returns `supported=False`) and regression-tested against clean answers from tonight —
+one apparent regression turned out to be the same mistake as before (an abbreviated source
+excerpt in the test, not the real full field text); confirmed clean once tested against the
+actual full source.
+
+## The clearest proof yet of the term-overlap ceiling — T1687 (v4), 2026-08-10
+
+Auditing `T1687`'s v4 run (post all four fixes, including the dedup fix above) found something
+more important than another bug instance: proof the ceiling on term-overlap verification isn't a
+threshold-calibration problem at all.
+
+A `trusted` answer claimed *"vulnerabilities in cloud-based (**IaaS**/SaaS) infrastructure..."* —
+"IaaS" does not appear anywhere in the `description` field. It's real, but it's from the node's
+separate `platforms` property (`['IaaS', 'Linux', 'macOS', 'SaaS', 'Windows']`) — smuggled into a
+claim cited against a different field. Checked precisely: **14 of 15 salient terms matched
+(93.3%)** — only "IaaS" itself failed. The clause is a single atomic sentence (nothing for the
+dilution fix to split) with no duplicate terms (not the dedup bug). One fabricated, specific,
+checkable fact, buried inside a sentence that's otherwise 93% correct, is completely invisible to
+a ratio-based check — and no threshold adjustment fixes this. A threshold strict enough to catch
+one wrong word in an otherwise-accurate sentence would reject enormous numbers of genuinely
+correct answers that simply paraphrase loosely. This is the difference between "how much of this
+matches" (what term-overlap measures) and "is every specific entity actually present" (what it
+cannot). That's exactly the gap the NLI-classifier / entity-level-check `BACKLOG.md` item exists
+to close — this case makes it a mechanism-ceiling problem, not a calibration problem, concretely
+rather than theoretically.
+
+Same audit also found two more instances of already-logged categories: a third
+`coincidental_term_overlap` case (a `trusted` claim about "zero-day" vulnerabilities sourced from
+a citation *title*, not the actual claim text) and a recurrence of `unsupported_recategorization`
+specific to this node (source lists antivirus/EDR/firewalls as one "security tools" category; the
+model invented a tools-vs-infrastructure comparison and miscategorized firewalls into the wrong
+side of it). All four logged in `results/narrowing_gate_labeled_audit.jsonl` (now 21 examples).
+
+## Three more fixes — T1113's false negative and the IaaS sibling-field veto, 2026-08-10
+
+Found at the very end of the v4 chain (`T1113`) and during the T1687 audit above. All three are
+zero-GPU, pure Python, fixed and verified in parallel with the (separate, already-finished) v4
+chain — same "safe to edit, unsafe to live-test mid-run" distinction as the dedup fix.
+
+- **Trailing punctuation stripped from tokens in `_salient_terms()`.** The regex's character
+  class allows internal periods (needed for real tokens like `T1055.011`), which let end-of-
+  sentence periods ride along as part of the last word — `"screenshots."` never matched source's
+  `"screenshot"` for exactly that reason.
+- **`_term_in_text()` — minimal plural/singular tolerance.** Not a full stemmer, just a trailing-
+  `s` check both directions. `"screenshots"` (clause) now matches source's `"screenshot"`.
+- **The cited node's own ID excluded from required terms**, via a new `cited_node_id` parameter
+  threaded through `_clause_supported()`. A description never self-references its own technique
+  ID; requiring `"T1113"` to appear inside `T1113`'s own description was a guaranteed failure
+  regardless of the claim's truth.
+- **Sibling-field hard veto**, via a new `sibling_text` parameter (the cited node's other property
+  values, concatenated). If a term fails against the cited field but *is* found in a sibling field
+  on the same node, that's confirmed evidence of wrong-field citation — hard veto regardless of
+  overall ratio. This is what actually closes the T1687 "IaaS" case: previously 14/15 terms
+  matched (93.3%, passed easily) because the fabrication was diluted by an otherwise-correct
+  sentence; the veto catches it directly instead of relying on the ratio noticing a single
+  diluted miss. Does not claim to close the general term-overlap-vs-entailment ceiling — the
+  NLI-classifier item in `BACKLOG.md` still stands for cases with no sibling field to check
+  against (the citation-title cases, the invented-causal-link cases).
+
+All three unit-tested against the exact real cases that motivated them, then a full regression
+pass against every previously-confirmed fabrication (T1053.005 x2, T1205.002) and clean answer
+(T1055.011, T1053.005) using real full source text — 5/5 pass, nothing broken.
+
+**Update — the compound-citation fix was too narrow, found by continuing to audit every node as
+it landed rather than stopping once "enough" bugs were found.** `T1047` landed on the *pre-fix*
+code (confirmed: its log entries have no `attempted_answer` key at all, meaning the already-running
+chain process loaded the old module before the fixes were edited on disk — expected, a running
+process doesn't hot-reload). Its rejection reasons revealed a second, different way `EVIDENCE`
+citations break the naive parse:
+
+> *"cited field T1047:description mentions that WMIC will be replaced by PowerShell as the
+> primary WMI interface in subsequent Windows releases. is empty — nothing to verify against"*
+
+Not a compound `field1, field2` citation this time — the model appended a whole justification
+sentence after the field name instead of stopping. No comma before the runaway text, so the
+comma-split fix wouldn't have caught this shape at all. Generalized the fix: instead of splitting
+on comma, extract only the leading identifier-like token (`[A-Za-z_][A-Za-z0-9_]*`) from the
+field portion — this naturally subsumes the comma case too (a comma isn't part of an identifier
+either) and stops at the first space, comma, or punctuation regardless of what follows. Verified
+against both real cases plus a plain clean citation (no regression): all correctly extract
+`description`/`platforms` instead of a garbage multi-word key.
+
+---
+
 ## What changes in the existing specs
 
 This does not get implemented yet — this file is the design, not the build order. But it means,

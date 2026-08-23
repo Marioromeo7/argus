@@ -14,25 +14,43 @@ and marks the engagement closed.
 import json
 import re
 import os
+import time
 from datetime import datetime
-import ollama
+import config  # noqa: F401 -- side effect: forces OLLAMA_HOST. Must import
+                # before `ollama` -- see agents/red.py's comment on this.
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 MODEL = "qwen3:8b"
+EXEC_TIMEOUT = 60      # seconds, per GRAPHRANGE.md Phase 4 spec
+MONITOR_POLL_SECONDS = 3
+OLLAMA_CHAT_URL = f"{os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')}/api/chat"
 
 
 # ── LLM helper ────────────────────────────────────────────────────────────────
 
-def _think(prompt: str) -> str:
-    """Call Qwen3 in thinking mode; strip <think> blocks from output."""
-    resp = ollama.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": f"/think\n\n{prompt}"}],
-    )
-    text = resp["message"]["content"]
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+def _think(prompt: str, max_retries: int = 3) -> str:
+    """Call Qwen3 in thinking mode; strip <think> blocks from output.
+    Retries on Cloudflare 524 (origin timeout) with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(OLLAMA_CHAT_URL, json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": f"/think\n\n{prompt}"}],
+                "stream": False,
+            })  # no timeout — let Kaggle inference run as long as needed
+            r.raise_for_status()
+            text = r.json()["message"]["content"]
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 524 and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 30  # 30s, 60s, 120s
+                print(f"  [RETRY] Cloudflare timeout on attempt {attempt+1}/{max_retries}, waiting {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
 
 
 # ── Prompts & parsers ─────────────────────────────────────────────────────────
@@ -188,3 +206,87 @@ def plan_mitigation(driver, attack_plan: dict, context: dict = None) -> dict:
     print(f"  [BLUE] {mitigation_id} — effectiveness={mit['effectiveness']:.2f}, "
           f"priority={mit['priority']}, {len(mit['steps'])} steps")
     return {"status": "mitigated", "mitigation": mitigation}
+
+
+# ── Execution layer (GraphRange, Layer 7) ───────────────────────────────────────
+
+def monitor(supervisor_url: str, run_suffix: str, scenario: dict, stop_event) -> list:
+    """
+    ARGUS-LAYER-7: Blue daemon that runs in a thread during red execution,
+    polling the range for anomalies while red attacks. `run_suffix` must
+    match the value used when the scenario's containers were spawned (see
+    agents/red.py's execute_attack() and supervisor.py's spawn_scenario()) --
+    containers are actually named gr-{role}-{run_suffix}, not the literal
+    "blue"/"victim" placeholder strings GRAPHRANGE.md's spec text used.
+    stop_event: threading.Event, set by the caller when red is done.
+
+    Both checks below are deliberately coarse heuristics, not precise
+    attribution: tcpdump runs with -nn (no name/DNS resolution, per spec),
+    so there's no way to match captured traffic to the victim container by
+    name from this data alone -- any non-trivial capture during the window
+    is treated as "network activity observed," not "activity confirmed
+    to/from the victim specifically." Likewise, `ss -tnp` on the victim
+    reports ANY established connection, not just attacker-originated ones --
+    a real deployment would diff against a pre-attack baseline; this doesn't
+    have one to diff against yet.
+    """
+    blue_container = f"gr-blue-{run_suffix}"
+    victim_container = f"gr-victim-{run_suffix}"
+    events = []
+
+    while not stop_event.is_set():
+        try:
+            resp = requests.post(
+                f"{supervisor_url}/exec",
+                json={"container": blue_container,
+                      "command": "tcpdump -i any -c 10 -nn 2>/dev/null"},
+                timeout=EXEC_TIMEOUT,
+            )
+            tcpdump_out = resp.json().get("stdout", "") if resp.ok else ""
+        except requests.RequestException:
+            tcpdump_out = ""
+        if tcpdump_out.strip():
+            events.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "type": "unexpected_connection",
+                "detail": tcpdump_out[:300],
+            })
+
+        try:
+            resp = requests.post(
+                f"{supervisor_url}/exec",
+                json={"container": victim_container, "command": "ss -tnp 2>/dev/null"},
+                timeout=EXEC_TIMEOUT,
+            )
+            ss_out = resp.json().get("stdout", "") if resp.ok else ""
+        except requests.RequestException:
+            ss_out = ""
+        if "ESTAB" in ss_out:
+            events.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "type": "port_scan",
+                "detail": ss_out[:300],
+            })
+
+        stop_event.wait(MONITOR_POLL_SECONDS)
+
+    return events
+
+
+def assess_detection(detection_events: list, scenario: dict) -> dict:
+    """
+    ARGUS-LAYER-7: After a scenario ends, assess whether blue detected the
+    attack. Simple heuristic per spec -- any detection event during the
+    window counts as detected. `turn_detected` uses the event's index in
+    the list as a proxy for "which poll cycle first saw it" -- there's no
+    formal turn/round concept threaded through yet (that's Phase 7's
+    run_scenario.py orchestration, not built at this point).
+    """
+    if not detection_events:
+        return {"detected": False, "detection_type": "", "turn_detected": -1}
+    first = detection_events[0]
+    return {
+        "detected": True,
+        "detection_type": first.get("type", ""),
+        "turn_detected": 0,
+    }

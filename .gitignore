@@ -50,3 +50,6 @@ argus_context.zip
 
 # Private business docs (local only)
 INVESTOR_BRIEF.md
+
+# Node / dashboard UI (dashboard/ui/dist/ already covered by dist/ above)
+node_modules/

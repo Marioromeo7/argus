@@ -145,6 +145,16 @@ Every edge must follow this schema — flat labels like "exploits" are NOT accep
 | Blue agent mitigation planning | Qwen3 8B | **/think mode** |
 | Reflexion self-critique | Qwen3 8B | **/think mode** |
 
+> **Superseded 2026-08-19:** the "Challenger agent grain evaluation" row above
+> describes the ORIGINAL self-graded design — one Qwen3 call proposes a
+> refinement, the same model in a different prompt judges it, a bias
+> [THESIS.md](THESIS.md) documents and fixes. The current design
+> (`agents/narrowing.py`) splits **asker** (generates `open_questions`) from
+> **answerer** (answers from independent evidence, verified per-clause), wired
+> as an **opt-in** alternative to `agents/challenger.py`, not yet the default —
+> see [THESIS.md](THESIS.md) for the mechanism and [ROADMAP.md](ROADMAP.md) R1
+> for validation status (post-fix, not yet run to completion).
+
 **How to use thinking mode with Ollama + Qwen3 8B:**
 ```python
 import ollama
@@ -205,6 +215,15 @@ Phase 1 (schema + ingestion + retrieval, checklist below) is complete:
 
 Remaining v0 finalization work is tracked in [BACKLOG.md](BACKLOG.md) (paper draft, hosted demo,
 stronger evaluations). Do not add features outside the six layers without listing them there first.
+
+**Beyond this v0** (added since, not yet reflected in the sections above): a
+Docker-based cyber range (GraphRange, Layer 7) and a repo-scanning product
+(Scanner, Layer 8) are largely built and zero-GPU-verified but not yet
+live-validated, and the narrowing engine above is a coded, opt-in redesign of
+the Challenger, also not yet post-fix-validated. **[ROADMAP.md](ROADMAP.md)**
+is the live, decision-oriented status tracker — read it alongside this file
+for current scope; this file stays the durable rulebook (schema, layer order,
+model rules).
 
 ---
 

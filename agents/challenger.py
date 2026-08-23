@@ -10,40 +10,77 @@ on the outcome and logged to challenger_log.
 This is the mechanism that makes ARGUS nodes self-aware of what
 they don't know about themselves.
 
-A drop-in alternative exists in agents/narrowing.py (challenge_node_v2) —
-an asker/answerer split instead of this module's self-graded loop, per
-THESIS.md. Not the default yet: unvalidated by a post-bugfix run. See
-THESIS.md before swapping it in.
+SUPERSEDED as the system default 2026-08-19 (ROADMAP R1.3) by
+agents/narrowing.py's challenge_node_v2() — an asker/answerer split fixing
+this module's self-graded bias (the same model proposing AND judging its own
+refinement), now validated (ROADMAP R1.1/R1.2). This module is kept for
+`assess_proposal()` (still used by agents/crawler.py's pre-write gate, a
+separate mechanism from grain refinement) and as a reference implementation;
+its own smoke test (scripts/test_challenger.py) still legitimately exercises
+it. New grain-refinement call sites should use challenge_node_v2, not
+challenge_node/run_challenger below. See THESIS.md and ROADMAP.md.
 """
 
 import re
 import json
+import os
+import time
 from datetime import datetime
-import ollama
+import config  # noqa: F401 -- side effect: loads .env + forces OLLAMA_HOST.
+                # Must import before `ollama` -- see agents/red.py's comment.
+import requests
 from graph.retrieval import get_low_grain_nodes, get_node
+from dotenv import load_dotenv
+
+load_dotenv()
 
 MODEL = "qwen3:8b"
+OLLAMA_CHAT_URL = f"{os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')}/api/chat"
 
 
 # ── LLM helpers ──────────────────────────────────────────────────────────────
 
-def _think(prompt: str) -> str:
-    """Call Qwen3 in thinking mode; strip <think> blocks from output."""
-    resp = ollama.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": f"/think\n\n{prompt}"}],
-    )
-    text = resp["message"]["content"]
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+def _think(prompt: str, max_retries: int = 3) -> str:
+    """Call Qwen3 in thinking mode; strip <think> blocks from output.
+    Retries on Cloudflare 524 (origin timeout) with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(OLLAMA_CHAT_URL, json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": f"/think\n\n{prompt}"}],
+                "stream": False,
+            })  # no timeout — let Kaggle inference run as long as needed
+            r.raise_for_status()
+            text = r.json()["message"]["content"]
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 524 and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 30
+                print(f"  [RETRY] Cloudflare timeout on attempt {attempt+1}/{max_retries}, waiting {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
 
 
-def _fast(prompt: str) -> str:
-    """Call Qwen3 in standard mode (no chain-of-thought)."""
-    resp = ollama.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": f"/no_think\n\n{prompt}"}],
-    )
-    return resp["message"]["content"].strip()
+def _fast(prompt: str, max_retries: int = 3) -> str:
+    """Call Qwen3 in standard mode (no chain-of-thought).
+    Retries on Cloudflare 524 with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(OLLAMA_CHAT_URL, json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": f"/no_think\n\n{prompt}"}],
+                "stream": False,
+            })
+            r.raise_for_status()
+            return r.json()["message"]["content"].strip()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 524 and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 30
+                print(f"  [RETRY] Cloudflare timeout on attempt {attempt+1}/{max_retries}, waiting {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
 
 
 # ── Prompt builders ───────────────────────────────────────────────────────────

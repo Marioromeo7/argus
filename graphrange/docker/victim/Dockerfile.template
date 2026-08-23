@@ -1,0 +1,9 @@
+FROM {base_image}
+# {base_image} resolved from CPE at runtime:
+# cpe:2.3:o:canonical:ubuntu:20.04 -> ubuntu:20.04
+# cpe:2.3:a:apache:http_server:2.4.49 -> httpd:2.4.49 (or closest available)
+RUN apt-get update 2>/dev/null || true
+{install_commands}
+# {install_commands} = apt-get install -y {vulnerable_software}=={version}
+EXPOSE {ports}
+CMD {start_command}

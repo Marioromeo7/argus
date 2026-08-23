@@ -1,0 +1,322 @@
+"""
+ARGUS-SCANNER: Generalized multi-container victim builder.
+Supports any repo regardless of framework or language -- one container per
+detected application layer. Red agent gets the full topology and reasons
+its own attack path across it.
+"""
+
+import os
+import re
+import json
+import subprocess
+from pathlib import Path
+
+import yaml
+import requests
+
+from graphrange.telemetry import track, count_tokens, patch_last_tokens_out
+from config import OLLAMA_CHAT_URL as OLLAMA_URL
+
+QWEN_MODEL = "qwen3:8b"
+
+# Manifest files by ecosystem -- checked in priority order per directory.
+MANIFEST_PRIORITY = [
+    ("pom.xml", "java_maven"),
+    ("build.gradle", "java_gradle"),
+    ("composer.json", "php_laravel"),
+    ("package.json", "node"),
+    ("requirements.txt", "python"),
+    ("pyproject.toml", "python"),
+    ("Gemfile", "ruby_rails"),
+    ("go.mod", "go"),
+    ("Cargo.toml", "rust"),
+    ("*.csproj", "dotnet"),
+    ("*.sln", "dotnet"),
+]
+
+UNSAFE_FLAGS = [
+    "privileged: true",
+    "network_mode: host",
+    "pid: host",
+    "ipc: host",
+    "cap_add:",
+    "security_opt: []",
+]
+ALLOWED_REGISTRIES = {"docker.io", "ghcr.io", "gcr.io", "public.ecr.aws"}
+
+
+def _log(msg: str) -> None:
+    print(f"[VictimBuilder] {msg}", flush=True)
+
+
+def _infer_role(service_name: str, ports: list, image: str) -> str:
+    """ARGUS-SCANNER: Infers a service's role from its name, ports, and
+    image. Name keywords are checked before port ranges: port 8080 is
+    listed under both web_frontend and api_backend in spec (the ranges
+    genuinely overlap), so a clearly-named service like "api-server" on
+    :8080 should resolve by its name, not lose to an ambiguous port match
+    -- confirmed as a real mismatch via a live test before this ordering
+    was added (api-server on :8080 was resolving to web_frontend)."""
+    name = service_name.lower()
+    img = (image or "").lower()
+    port_nums = set()
+    for p in ports:
+        for m in re.finditer(r"(\d+)(?:/(?:tcp|udp))?", str(p)):
+            port_nums.add(int(m.group(1)))
+
+    name_matches = [
+        ("cache", ("redis", "cache", "memcache")),
+        ("database", ("db", "mysql", "postgres", "mongo")),
+        ("queue", ("queue", "rabbit", "kafka")),
+        ("worker", ("worker", "celery", "sidekiq", "consumer")),
+        ("api_backend", ("api", "backend", "app", "server")),
+        ("web_frontend", ("web", "nginx", "apache", "front")),
+    ]
+    for role, keywords in name_matches:
+        if any(k in name for k in keywords):
+            return role
+
+    if port_nums & {6379}:
+        return "cache"
+    if port_nums & {3306, 5432, 27017} or any(k in img for k in
+                                               ("mysql", "postgres", "mongo")):
+        return "database"
+    if any(8000 <= p <= 9000 for p in port_nums):
+        return "api_backend"
+    if port_nums & {80, 443, 8080}:
+        return "web_frontend"
+    return "unknown"
+
+
+def _infer_compose_from_manifests(manifest_map: dict) -> str:
+    """ARGUS-SCANNER: Qwen reasons over detected manifests to produce a
+    docker-compose.yml wiring all application layers together. The one
+    model call in this module -- everything else is pure detection/parsing.
+    Not live-tested as of writing (2026-08-10) -- holding at the same
+    live-GPU-call checkpoint as GraphRange Phase 7."""
+    prompt = (
+        "Given these project manifest files from a single repository:\n"
+        f"{json.dumps(manifest_map)}\n\n"
+        "Write a docker-compose.yml that:\n"
+        "1. Creates one service per application layer detected\n"
+        "2. Uses the correct base image and version for each\n"
+        "3. Wires services together correctly (e.g. app connects to db)\n"
+        "4. Exposes the internet-facing service on a public port\n"
+        "5. Keeps all other services on an internal network only\n"
+        "6. Includes realistic environment variables for service connectivity\n\n"
+        "Return ONLY the docker-compose.yml content. No explanation."
+    )
+    tokens_in = count_tokens(prompt)
+    with track("scanner.victim_builder._infer_compose_from_manifests",
+               model="qwen", tokens_in=tokens_in, tokens_out=0):
+        resp = requests.post(
+            OLLAMA_URL,
+            json={"model": QWEN_MODEL,
+                  "messages": [{"role": "user", "content": f"/no_think\n\n{prompt}"}],
+                  "stream": False},
+            timeout=600,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["message"]["content"].strip()
+    patch_last_tokens_out(count_tokens(raw))
+    return re.sub(r"^```(?:ya?ml)?\s*|\s*```$", "", raw.strip())
+
+
+def _validate_compose(compose_path: str) -> None:
+    """ARGUS-SCANNER: Validates a compose file before it's ever run. Raises
+    ValueError on any failure -- called before every `docker compose up`,
+    no exceptions."""
+    result = subprocess.run(
+        ["docker", "compose", "-f", compose_path, "config"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"Compose validation failed: {result.stderr.strip()}")
+
+    with open(compose_path, encoding="utf-8") as f:
+        text = f.read()
+    for flag in UNSAFE_FLAGS:
+        if flag in text:
+            raise ValueError(
+                f"Unsafe flag '{flag}' in compose file -- isolation breach "
+                f"risk. Remove it and retry."
+            )
+
+    parsed = yaml.safe_load(text) or {}
+    for name, svc in (parsed.get("services") or {}).items():
+        image = svc.get("image")
+        if not image:
+            continue
+        first_segment = image.split("/")[0]
+        registry = first_segment if ("/" in image and "." in first_segment) else "docker.io"
+        if registry not in ALLOWED_REGISTRIES:
+            raise ValueError(
+                f"Rejected: service {name!r} uses image {image!r} from "
+                f"disallowed registry {registry!r} (allowed: "
+                f"{', '.join(sorted(ALLOWED_REGISTRIES))})"
+            )
+
+
+def _compose_up(compose_path: str) -> None:
+    """ARGUS-SCANNER: Validates then brings up a compose file -- the only
+    path anything in this module uses to actually run containers."""
+    _validate_compose(compose_path)
+    result = subprocess.run(
+        ["docker", "compose", "-f", compose_path, "up", "-d"],
+        capture_output=True, text=True, timeout=300,
+    )
+    if result.returncode != 0:
+        raise ValueError(f"docker compose up failed: {result.stderr.strip()}")
+
+
+def _service_image(svc: dict) -> str:
+    """ARGUS-SCANNER: A service can specify `image:` or `build:` (a path
+    string or a dict with a `context` key) -- normalize to one string."""
+    if svc.get("image"):
+        return str(svc["image"])
+    build = svc.get("build")
+    if isinstance(build, dict):
+        return str(build.get("context", ""))
+    return str(build or "")
+
+
+def _parse_topology(compose_path: str) -> dict:
+    """ARGUS-SCANNER: Parses a (validated, already-up) compose file into
+    the topology dict shape, including real container IDs from
+    `docker compose ps`."""
+    with open(compose_path, encoding="utf-8") as f:
+        parsed = yaml.safe_load(f.read()) or {}
+
+    ps_result = subprocess.run(
+        ["docker", "compose", "-f", compose_path, "ps", "--format", "json"],
+        capture_output=True, text=True, timeout=30,
+    )
+    container_ids = {}
+    if ps_result.returncode == 0 and ps_result.stdout.strip():
+        # `docker compose ps --format json` emits either a JSON array or
+        # JSON-lines depending on Compose version -- handle both rather
+        # than assuming one.
+        raw = ps_result.stdout.strip()
+        try:
+            entries = json.loads(raw)
+            if isinstance(entries, dict):
+                entries = [entries]
+        except json.JSONDecodeError:
+            entries = []
+            for line in raw.splitlines():
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        for entry in entries:
+            container_ids[entry.get("Service")] = entry.get("ID", "")
+
+    services = []
+    for name, svc in (parsed.get("services") or {}).items():
+        ports = svc.get("ports", []) or []
+        networks = svc.get("networks", []) or []
+        if isinstance(networks, dict):
+            networks = list(networks.keys())
+        image = _service_image(svc)
+        services.append({
+            "name": name,
+            "role": _infer_role(name, ports, image),
+            "image": image,
+            "ports": [str(p) for p in ports],
+            "networks": [str(n) for n in networks],
+            "container_id": container_ids.get(name, ""),
+            "ecosystem": "",
+            "entry_point": False,
+        })
+
+    public_ports = []
+    for svc in services:
+        for p in svc["ports"]:
+            m = re.match(r"^(\d+):", p)
+            if m:
+                public_ports.append((int(m.group(1)), svc["name"]))
+    if public_ports:
+        entry_name = min(public_ports)[1]
+        for svc in services:
+            svc["entry_point"] = (svc["name"] == entry_name)
+
+    network_map = {}
+    for svc in services:
+        peers = [s["name"] for s in services
+                 if s["name"] != svc["name"]
+                 and set(s["networks"]) & set(svc["networks"])]
+        network_map[svc["name"]] = peers
+
+    return {"compose_file": compose_path, "services": services, "network_map": network_map}
+
+
+def _scan_manifests(repo_path: str) -> dict:
+    """ARGUS-SCANNER: Walks repo root and one level of subdirectories,
+    collecting manifest files by ecosystem. Returns {ecosystem: file_content},
+    first match per ecosystem wins."""
+    manifest_map = {}
+    search_dirs = [repo_path] + [
+        os.path.join(repo_path, d) for d in os.listdir(repo_path)
+        if os.path.isdir(os.path.join(repo_path, d)) and not d.startswith(".")
+    ]
+    for directory in search_dirs:
+        for pattern, ecosystem in MANIFEST_PRIORITY:
+            if ecosystem in manifest_map:
+                continue
+            if "*" in pattern:
+                matches = list(Path(directory).glob(pattern))
+            else:
+                candidate = Path(directory) / pattern
+                matches = [candidate] if candidate.exists() else []
+            for match in matches:
+                try:
+                    manifest_map[ecosystem] = match.read_text(
+                        encoding="utf-8", errors="replace")
+                    break
+                except OSError:
+                    continue
+    return manifest_map
+
+
+def build_victim_topology(repo_path: str) -> dict:
+    """
+    ARGUS-SCANNER: Detects all application layers in the repo and builds
+    a multi-container topology. Returns the topology dict used by the
+    supervisor to spawn victim containers and by the red agent for attack
+    planning.
+
+    Step 1: use a real docker-compose.yml at the repo root if present.
+    Step 2/3: otherwise scan for manifests and have Qwen infer a compose
+    file from them (the one GPU-touching path in this module).
+    """
+    for filename in ("docker-compose.yml", "docker-compose.yaml"):
+        compose_path = os.path.join(repo_path, filename)
+        if os.path.exists(compose_path):
+            _log(f"found {filename}, using it directly")
+            _compose_up(compose_path)
+            return _parse_topology(compose_path)
+
+    _log("no compose file found, scanning manifests")
+    manifest_map = _scan_manifests(repo_path)
+    if not manifest_map:
+        raise ValueError(
+            f"No docker-compose.yml and no recognized manifests found in {repo_path}"
+        )
+
+    _log(f"found manifests: {list(manifest_map.keys())}, inferring compose via Qwen")
+    compose_content = _infer_compose_from_manifests(manifest_map)
+    compose_path = os.path.join(repo_path, "docker-compose.argus.yml")
+    with open(compose_path, "w", encoding="utf-8") as f:
+        f.write(compose_content)
+
+    _compose_up(compose_path)
+    return _parse_topology(compose_path)
+
+
+def teardown_victim_topology(topology: dict) -> None:
+    """ARGUS-SCANNER: Tears down all victim containers after a scenario
+    completes."""
+    subprocess.run(
+        ["docker", "compose", "-f", topology["compose_file"], "down", "--remove-orphans"],
+        capture_output=True, text=True, timeout=60,
+    )

@@ -20,9 +20,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import requests as _http
 from dotenv import load_dotenv
 load_dotenv()
+from config import OLLAMA_CHAT_URL as OLLAMA_URL
 
 MODEL       = "qwen3:8b"
-OLLAMA_URL  = "http://localhost:11434/api/chat"
 BATCH_SIZE  = 50
 BATCH_SLEEP = 2  # seconds between batches
 FAIL_LOG    = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

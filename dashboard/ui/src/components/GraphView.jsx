@@ -1,5 +1,6 @@
-import React, { useRef, useCallback } from 'react'
+import React, { useRef, useCallback, useImperativeHandle, forwardRef } from 'react'
 import ForceGraph2D from 'react-force-graph-2d'
+import GraphChat from './GraphChat'
 
 const TYPE_COLOR = {
   vulnerability: '#e05252',
@@ -11,8 +12,38 @@ const TYPE_COLOR = {
   unknown:       '#6b7280',
 }
 
-export default function GraphView({ graphData, selected, onSelect }) {
+const GraphView = forwardRef(function GraphView(
+  { graphData, selected, onSelect, onNavigated }, ref
+) {
   const fgRef = useRef()
+
+  // ARGUS-SCANNER: resolves against the live graphData (which carries d3's
+  // x/y) by id, so callers can pass either a bare {id,label,type} ref (from
+  // /api/llm/navigate or /api/chat's grounded_node) or an already-live node
+  // -- either way this finds the real positioned node before panning.
+  //
+  // /api/graph only renders the 800 most-recently-updated nodes (a
+  // performance cap, not a bug) out of ~3672 real nodes -- but chat/search
+  // can ground in any of them. A node outside that rendered subset has no
+  // x/y to pan to at all. Silently doing nothing there is indistinguishable
+  // from a broken feature, so fall back to opening its detail sidebar
+  // (which fetches by id directly, independent of what's rendered) instead
+  // of dropping the result on the floor.
+  const navigateToNode = useCallback((nodeRef) => {
+    if (!nodeRef || !fgRef.current) return
+    const live = graphData.nodes.find(n => n.id === nodeRef.id)
+    if (live) {
+      fgRef.current.centerAt(live.x, live.y, 800)  // smooth pan 800ms
+      fgRef.current.zoom(6, 800)                     // zoom to level 6
+      onNavigated && onNavigated(live)
+    } else {
+      onNavigated && onNavigated(nodeRef)
+    }
+  }, [graphData, onNavigated])
+
+  // ARGUS-SCANNER: exposes navigateTo() so App.jsx can pan/zoom to a node
+  // the LLM search picked, without GraphView needing to know why.
+  useImperativeHandle(ref, () => ({ navigateTo: navigateToNode }), [navigateToNode])
 
   const paintNode = useCallback((node, ctx, scale) => {
     const r          = Math.max(3, node.val || 4)
@@ -90,6 +121,10 @@ export default function GraphView({ graphData, selected, onSelect }) {
           </div>
         ))}
       </div>
+
+      <GraphChat onGrounded={navigateToNode} />
     </div>
   )
-}
+})
+
+export default GraphView

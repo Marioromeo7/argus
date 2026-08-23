@@ -2,6 +2,8 @@ import React, { useState, useEffect, useCallback, useRef } from 'react'
 import GraphView from './components/GraphView'
 import MetricsStrip from './components/MetricsStrip'
 import NodeSidebar from './components/NodeSidebar'
+import LLMSearch from './components/LLMSearch'
+import TelemetryPanel from './components/TelemetryPanel'
 
 const POLL_MS = 5000
 
@@ -15,6 +17,13 @@ export default function App() {
   // Keyed by node id — holds live node objects that d3 mutates with x/y/vx/vy.
   // Reusing the same objects across polls keeps node positions stable.
   const liveNodes = useRef(new Map())
+
+  // ARGUS-SCANNER: ref into GraphView for LLM-search-driven pan/zoom.
+  const graphRef = useRef()
+
+  function handleNavigate(node) {
+    graphRef.current && graphRef.current.navigateTo(node)
+  }
 
   const fetchGraph = useCallback(async () => {
     try {
@@ -69,6 +78,7 @@ export default function App() {
           <span className="header-name">ARGUS</span>
           <span className="header-sub">Autonomous Reasoning Graph for Unified Security</span>
         </div>
+        <LLMSearch onNavigate={handleNavigate} />
         <div className={`status-pill status-${status}`}>
           <span className="status-dot" />
           {status}
@@ -79,13 +89,16 @@ export default function App() {
 
       <div className="workspace">
         <GraphView
+          ref={graphRef}
           graphData={graphData}
           selected={selected}
           onSelect={setSelected}
+          onNavigated={node => setSelected(node)}
         />
         {selected && (
           <NodeSidebar nodeId={selected.id} onClose={() => setSelected(null)} />
         )}
+        <TelemetryPanel />
       </div>
     </div>
   )

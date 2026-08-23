@@ -20,41 +20,59 @@ Diversity controls (added after reflexion analysis showed 7.6% waste):
 import json
 import re
 import os
+import time
 from datetime import datetime
 
 import numpy as np
-import ollama
+import config  # noqa: F401 -- side effect: forces OLLAMA_HOST. Must import
+                # before `ollama` -- see agents/red.py's comment on this.
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 MODEL               = "qwen3:8b"
+OLLAMA_CHAT_URL    = f"{os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')}/api/chat"
 DUPLICATE_THRESHOLD = 0.93   # skip write if lesson is this similar to recent ones
 SKIP_LOG            = os.path.join("results", "reflexion_skips.jsonl")
 
 
 # ── LLM helper ────────────────────────────────────────────────────────────────
 
-def _think(prompt: str) -> str:
-    """Call Qwen3 in thinking mode; strip <think> blocks from output."""
-    resp = ollama.chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": f"/think\n\n{prompt}"}],
-    )
-    text = resp["message"]["content"]
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+def _think(prompt: str, max_retries: int = 3) -> str:
+    """Call Qwen3 in thinking mode; strip <think> blocks from output.
+    Retries on Cloudflare 524 (origin timeout) with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(OLLAMA_CHAT_URL, json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": f"/think\n\n{prompt}"}],
+                "stream": False,
+            })  # no timeout — let Kaggle inference run as long as needed
+            r.raise_for_status()
+            text = r.json()["message"]["content"]
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 524 and attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 30  # 30s, 60s, 120s
+                print(f"  [RETRY] Cloudflare timeout on attempt {attempt+1}/{max_retries}, waiting {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
 
 
 # ── Embedding & dedup helpers ─────────────────────────────────────────────────
 
 def _embed(text: str) -> np.ndarray:
     """Embed text with nomic-embed-text on CPU (avoids VRAM conflict with Qwen3)."""
-    resp = ollama.embeddings(
-        model="nomic-embed-text",
-        prompt=text[:512],
-        options={"num_gpu": 0},
-    )
-    return np.array(resp["embedding"], dtype=np.float32)
+    embed_url = f"{os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')}/api/embeddings"
+    r = requests.post(embed_url, json={
+        "model": "nomic-embed-text",
+        "prompt": text[:512],
+        "options": {"num_gpu": 0},
+    })  # no timeout
+    r.raise_for_status()
+    return np.array(r.json()["embedding"], dtype=np.float32)
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:

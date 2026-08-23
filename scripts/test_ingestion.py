@@ -30,7 +30,8 @@ def test_neo4j_connection():
 
 def test_ollama_connection():
     import requests
-    resp = requests.get("http://localhost:11434/api/tags", timeout=5)
+    from config import OLLAMA_TAGS_URL
+    resp = requests.get(OLLAMA_TAGS_URL, timeout=5)
     models = [m["name"] for m in resp.json().get("models", [])]
     assert any("qwen3" in m for m in models), \
         f"qwen3:8b not found. Run: ollama pull qwen3:8b\nFound: {models}"

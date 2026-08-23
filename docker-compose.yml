@@ -9,6 +9,13 @@ services:
       - NEO4J_URI=bolt://host.docker.internal:7400
       - NEO4J_USER=neo4j
       - NEO4J_PASSWORD=argus1234
+      # Reverted to unset 2026-08-12 (Kaggle tunnel died, weekly GPU quota
+      # exhausted) -- falls back to dashboard/api/main.py's own default of
+      # http://host.docker.internal:11434/api/chat, i.e. local Ollama.
+    volumes:
+      # Shares logs/telemetry.jsonl with host-side scripts (graphrange/scanner/eval),
+      # so /api/telemetry and TelemetryPanel see real runs, not just this container's own.
+      - ./logs:/app/logs
     # Allows container to reach Neo4j Desktop running on the host.
     # On Docker Desktop for Windows/Mac this works natively via host.docker.internal.
     # On Linux, uncomment the line below instead:
@@ -16,3 +23,28 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+
+  # ARGUS-LAYER-7 — GraphRange (opt-in via `docker compose --profile graphrange up`)
+  # Red/blue/victim containers are NOT defined here — gr-supervisor spawns them
+  # dynamically per scenario via the Docker SDK (graphrange/docker/supervisor/supervisor.py).
+  gr-supervisor:
+    profiles: ["graphrange"]
+    build: graphrange/docker/supervisor
+    container_name: gr-supervisor
+    ports:
+      - "8000:8000"
+    networks:
+      - gr-public
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # supervisor manages child containers
+    environment:
+      - NEO4J_URI=bolt://host.docker.internal:7400
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=argus1234
+      - GR_NETWORK=graphrange-public
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  gr-public:
+    name: graphrange-public

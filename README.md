@@ -107,11 +107,18 @@ been run at least once; results and honest framing (including where statistical 
 - [x] Challenger, crawler, red/blue, and reflexion agents
 - [x] End-to-end smoke tests (Layers 1–6)
 - [x] Evaluations: retrieval precision, grain convergence, co-evolution, hardware feasibility
-- [ ] Research paper draft (outline only so far)
+- [x] Research paper draft — [PAPER_DRAFT.md](PAPER_DRAFT.md) (architecture + methods complete,
+      results transcribed from the ledger; no longer outline-only)
 - [ ] Hosted public read-only demo (see [PRODUCT_HOSTING_HANDOFF.md](PRODUCT_HOSTING_HANDOFF.md))
 
 **This is a research artifact, not production SaaS.** See [BACKLOG.md](BACKLOG.md) for the gap to
 production (auth, tenant isolation, safety boundaries, richer serialization, stronger evaluations).
+
+**Beyond this v0:** a Docker-based cyber range (GraphRange, Layer 7) and a
+repo-scanning product (Scanner, Layer 8) are largely built on top of this
+foundation but not yet live-validated, alongside a redesigned narrowing
+engine. See [ROADMAP.md](ROADMAP.md) for current, live status — this section
+describes the six-layer v0 baseline only.
 
 ---
 
@@ -132,11 +139,13 @@ The agents write to Neo4j; the dashboard only reads. See [dashboard/](dashboard/
 
 | File | Purpose |
 |------|---------|
+| [ROADMAP.md](ROADMAP.md) | **Live master task list** — current decisions + open work across research and product |
 | [AGENTS.md](AGENTS.md) / [CLAUDE.md](CLAUDE.md) | Project rulebook — the layer spec and build rules |
 | [CONTEXT.md](CONTEXT.md) | Current state, graph stats, evaluation results, hard-won Ollama quirks |
+| [PAPER_DRAFT.md](PAPER_DRAFT.md) | Working paper draft (architecture + methods complete) |
 | [PAPER_CLAIMS.md](PAPER_CLAIMS.md) | Each paper claim mapped to: demonstrated / partial / future work |
-| [PLAN.md](PLAN.md) | v0 finalization plan and definition of done |
-| [BACKLOG.md](BACKLOG.md) | Out-of-scope work for v0 (production hardening, stronger evals) |
+| [PLAN.md](PLAN.md) | v0 finalization plan and definition of done *(historical — v0 baseline only, see ROADMAP.md for current scope)* |
+| [BACKLOG.md](BACKLOG.md) | Dated archaeology + out-of-scope work (production hardening, stronger evals) |
 | [PRODUCT_HOSTING_HANDOFF.md](PRODUCT_HOSTING_HANDOFF.md) | How to ship a safe, read-only public demo |
 | [docs/FINAL_DOD.md](docs/FINAL_DOD.md) | v0 acceptance checklist — what's built, proven, deferred |
 | [docs/EVALUATION_PLAN.md](docs/EVALUATION_PLAN.md) | Plan to strengthen the evaluations (larger samples, significance) |
