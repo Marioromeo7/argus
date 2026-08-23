@@ -23,7 +23,7 @@ import socket
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from graphrange.victim_builder import spawn_scenario
+from graphrange.docker.supervisor.supervisor import spawn_scenario
 
 
 def wait_for_port(host: str, port: int, timeout: int = 30, service_name: str = "service") -> bool:
@@ -68,8 +68,8 @@ def test_cyrus():
 
     print("[1] Spawning Cyrus IMAP 2.2.5 container...")
     try:
-        container = spawn_scenario(scenario, init=True)
-        host = container.network_settings["IPAddress"]
+        result = spawn_scenario(scenario)
+        host = result.get("victim_ip", result.get("victim", {}).get("ip"))
         print(f"[+] Container running at {host}:143")
     except Exception as e:
         print(f"[-] Failed to spawn container: {e}")
