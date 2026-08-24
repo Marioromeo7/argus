@@ -86,7 +86,7 @@ CMD ["/usr/cyrus/bin/master", "-d"]
 
     print("\n[2] Building Cyrus container image...")
     if not run_cmd(
-        f"docker build -f {dockerfile_path} -t cyrus-2.2.5 {tmpdir} 2>&1 | tail -30",
+        f"docker build -f {dockerfile_path} -t cyrus-2.2.5 {tmpdir}",
         "Building Docker image (this takes ~15-20 min)..."
     ):
         print("    [-] Build failed")
@@ -168,7 +168,7 @@ CMD ["sh", "-c", "ulimit -n 1024; /usr/local/squid/bin/squid -f /usr/local/squid
 
     print("\n[2] Building Squid container image...")
     if not run_cmd(
-        f"docker build -f {dockerfile_path} -t squid-2.2 {tmpdir} 2>&1 | tail -30",
+        f"docker build -f {dockerfile_path} -t squid-2.2 {tmpdir}",
         "Building Docker image (this takes ~10-15 min)..."
     ):
         print("    [-] Build failed")
