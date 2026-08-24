@@ -595,16 +595,15 @@ _MYSQL_SOURCES = {
         "url": "https://snapshot.debian.org/file/c5e8fd1bf362e739e525b53698b3efa60fe45462",
         "src_dir": "mysql-3.22.32.orig",
     },
-    # VULNERABLE target for CVE-2000-0148: 3.21.33b. This version is vulnerable
+    # VULNERABLE target for CVE-2000-0148: 3.21.33. This version is vulnerable
     # to the short-scramble password bypass (check_scramble() in sql/password.c
     # compares only the client-supplied length, no minimum check -- a 1-byte
     # scramble response bypasses auth in ~32 tries, no password required).
-    # Debian snapshot has the MySQL 3.21.33 source package; the exact file hash
-    # needs to be fetched from snapshot.debian.org. Downloaded + validated
-    # 2026-08-24 as part of P1.2 (MySQL recipe fix + authentic CVE demo).
-    "3.21.33b": {
-        "url": "https://snapshot.debian.org/file/7c9e5a1b6e8c3f2d0a1b4c5d6e7f8a9b",  # FILL AFTER VERIFICATION
-        "src_dir": "mysql-3.21.33.orig",
+    # Sourced from Internet Archive Wayback Machine (mysql.com archives from 1999).
+    # Downloaded + validated 2026-08-24 as part of P1.2 (MySQL recipe fix + authentic CVE demo).
+    "3.21.33": {
+        "url": "https://web.archive.org/web/19990601000000/mysql.com/Downloads/MySQL-3.21/mysql-3.21.33.tar.gz",
+        "src_dir": "mysql-3.21.33",
     },
 }
 
