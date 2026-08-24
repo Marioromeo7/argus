@@ -58,8 +58,9 @@ RUN apt-get update && apt-get install -y \\
     libssl-dev libsasl2-dev libdb-dev flex bison \\
     ca-certificates procps libncurses-dev
 RUN mkdir -p /tmp/build && cd /tmp/build && \\
-    git clone --depth 1 --branch cyrus-imapd-2.2.5 https://github.com/cyrusimap/cyrus-imapd.git && \\
+    git clone https://github.com/cyrusimap/cyrus-imapd.git && \\
     cd cyrus-imapd && \\
+    git checkout cyrus-imapd-2.2.5 || git checkout tags/cyrus-imapd-2.2.5 || true && \\
     cp /usr/share/misc/config.guess /usr/share/misc/config.sub . && \\
     cp /usr/share/misc/config.guess /usr/share/misc/config.sub cmulocal/ && \\
     aclocal -I ../cmulocal 2>/dev/null || aclocal -I cmulocal && \\
@@ -148,10 +149,10 @@ RUN cd /tmp/build/squid-2.2.STABLE5 && \\
     (ulimit -n 1024 && make 2>&1 | tail -20) && \\
     (ulimit -n 1024 && make install 2>&1 | tail -5)
 RUN mkdir -p /usr/local/squid/var/cache /usr/local/squid/var/logs && \\
-    (ulimit -n 1024 && /usr/local/squid/bin/squid -z 2>&1 | tail -5)
-RUN (ulimit -n 1024 && /usr/local/squid/bin/squid -f /etc/squid/squid.conf -d 9 2>&1 || true) &
+    (ulimit -n 1024 && /usr/local/squid/bin/squid -z 2>&1 || true) && \\
+    cp /usr/local/squid/etc/squid.conf.default /usr/local/squid/etc/squid.conf
 EXPOSE 3128
-CMD ["sh", "-c", "ulimit -n 1024 && /usr/local/squid/bin/squid -f /etc/squid/squid.conf -N"]
+CMD ["sh", "-c", "ulimit -n 1024; /usr/local/squid/bin/squid -f /usr/local/squid/etc/squid.conf -N -d 5"]
 """
 
     import tempfile
