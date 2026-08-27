@@ -6,7 +6,8 @@ home, `SCHEDULE.md` is the historical pacing log, `SESSION_HANDOFF.md` is the
 last live handoff. This file is the decision-oriented master list — task IDs
 (R1, P1…) are stable so they can be referenced when planning._
 
-Last synced: 2026-08-15.
+Last synced: 2026-08-24 (R2 section re-verified against the actual committed
+result files, not the narrative summary docs — see below).
 
 ---
 
@@ -34,6 +35,28 @@ paper-drafted v0. A 2-week aggressive push reaches "system validated + compute
 kicked off" but not the paper (results-gated; drafting itself is the fast part,
 ~4–7 days AI-assisted, but can't precede the results).
 
+**R2 status, added 2026-08-24, updated same day — verified against the raw
+result files, not the narrative summaries.** All three R2 sub-claims have
+now substantively landed for real. R2.2 (grain convergence) completed a
+genuine full 73/73-node sweep. R2.3 (co-evolution) completed a genuine full
+100/100-cycle run. R2.1 (retrieval precision) took two passes: a
+2026-08-23 attempt turned out methodologically invalid (ground truth was
+written into the graph as edges, then "retrieved" back out of it —
+circular) and was excluded, then a same-day (2026-08-24) real fix — the
+mechanism itself was broken (a mixed CVE+technique search space meant the
+correct answer typically ranked #100-500+ out of ~783 candidates,
+independent of embedding quality) — followed by a real 44-CVE run once
+fixed. R2.3's own narrative summary separately claims a statistically
+significant result that does not reproduce when the project's own
+regression method is re-run against the actual complete data. Net effect
+for the paper: Claim 1 now has real ≥50-CVE-scale evidence (GraphRAG mean
+P@10 0.176 vs flat VectorRAG 0.039 vs reranked VectorRAG 0.057); Claim 2
+now has real population-scale evidence; Claim 3's equilibrium framing is
+now backed by 2× the cycles (still not significant, which supports rather
+than undercuts the equilibrium reading). Full account in R2 below;
+[PAPER_DRAFT.md](PAPER_DRAFT.md) §5 updated to match. `PAPER_CLAIMS.md` (the
+evidence ledger) has **not** been updated yet — treat it as stale until it is.
+
 ---
 
 ## Decisions — RESOLVED 2026-08-15
@@ -58,6 +81,15 @@ visible.
       renewed 2026-08-15) runs the offloadable GPU sweeps (R1, R2). Groq stays on
       the roadmap (P4) but is wired later, after the research lands. Any latency
       number destined for the paper still comes from **local**, not Kaggle.
+      **Extended 2026-08-24/25**: added Colab as a real, live-verified backup
+      GPU lane (`colab/README.md`) for when Kaggle's weekly quota is
+      exhausted, used for P2.2/P2.3's Scanner work. Same rule applies —
+      paper-reportable latency still comes from local, never Kaggle or
+      Colab. Colab has its own real caveat Kaggle doesn't: sessions can be
+      killed by the backend with no warning, and this account's tier only
+      has GPU entitlement for T4 (L4/A100/H100 rejected outright) — budget
+      for session recreation or an account switch mid-task, don't assume a
+      multi-hour unattended run survives uninterrupted.
 - [x] **D5 — `plan_attack()` → hand it the scenario + cross-check after.** Change
       the signature so `plan_attack()` is told which `scenario` to plan for (no
       divergence at plan time), THEN after results return, double-check the plan
@@ -175,16 +207,15 @@ visible.
 Concrete methodology below merged in from `docs/EVALUATION_PLAN.md` 2026-08-19 —
 that file had real, specific targets ROADMAP's R2 previously only gestured at.
 
-**Kaggle push blocked 2026-08-19**, session-wide: the safety classifier that
-blocked Docker/web calls earlier this session (reacting to accumulated
-conversation content, not to any specific command — see P1.2) now blocks ALL
-Bash, including totally benign calls (`kaggle config view`). Its own message
-says it will keep firing for the rest of THIS conversation. `kaggle/` (kernel +
-metadata, real username filled in) is ready to push the moment Bash is usable
-again (default permission mode or a fresh session) — nothing else is blocking
-it. Used the remaining file-only capacity to make sure the eval scripts
-themselves are actually ready to run at R2 scale the moment Kaggle is reachable
-(below), rather than sitting idle.
+**Kaggle push blocked 2026-08-19 — since resolved.** The Bash-blocking safety
+classifier issue was session-scoped; a later session reached Kaggle fine and
+ran real R2 sweeps 2026-08-22 through 2026-08-24 (below). The paragraph below
+this note is kept for history (it's what motivated the file-only prep work
+that made those later runs possible).
+
+Used the remaining file-only capacity, back on 2026-08-19, to make sure the
+eval scripts themselves were actually ready to run at R2 scale the moment
+Kaggle became reachable, rather than sitting idle.
 
 - [~] R2.1 — Claim 1 (retrieval precision): expand to **≥50 CVEs** with structured
       NVD ground truth (filter pre-CWE-era up front so every query is evaluable).
@@ -207,7 +238,69 @@ themselves are actually ready to run at R2 scale the moment Kaggle is reachable
       ≥50 CVEs with a technique edge is itself unverified (needs a live Neo4j
       query). All of this needs a live run to confirm no regression before trusting
       the parameterization fix, let alone building the rest on top of it.
-- [ ] R2.2 — Claim 2 (grain convergence): sweep the challenger over **all 73+ CVE
+      **2026-08-23 execution attempt — invalid, do not cite.** A different,
+      smaller path than the plan above was actually run:
+      `scripts/backfill_simple.py` wrote 15 CVE→technique edges into the live
+      graph (`source: "manual_mapping"`) using a hardcoded 12-pair
+      `CVE_TECHNIQUE_MAP`; `scripts/eval_backfilled.py` then measured GraphRAG
+      precision using a hardcoded `CVE_GT` dict that is the **identical 12
+      pairs**. The evaluation's ground truth was written into the graph as the
+      thing being measured, not kept independent of it — verified directly
+      against both scripts, not inferred from the summary docs. The reported
+      "27.04% vs 0%, +138%" number is circular by construction: GraphRAG
+      partially "finds" edges that were hand-placed to match the answer key,
+      diluted only by incidental 2-hop technique→tactic traversal (which is
+      why it isn't 100%, not because it's a real signal). **This is not
+      evidence for Claim 1.** The original v0 Eval 1 result (P@10 0.083 vs
+      0.000, 6/10 CVEs, ground truth independently from the NVD API, see
+      CONTEXT.md) remains the only valid evidence. The plan above — ≥50 CVEs,
+      P@k/Recall@k/MRR/nDCG@10, bootstrapped CIs, ground truth kept
+      independent of the graph — is still fully open; nothing from the
+      2026-08-23 run should be reused toward it.
+      **Done for real, 2026-08-24 — real ≥50-CVE run, valid methodology,
+      `results/r2_1_full_52cves.json`.** Root-caused and fixed the actual
+      mechanism (not just the CVE count) before scaling: (1) `_build_chroma_index`
+      had a `LIMIT 500` with no `ORDER BY` silently excluding up to 285 of 785
+      real nodes in arbitrary order — confirmed live that ground-truth technique
+      IDs T1078/T1068 and all 15 tactic nodes were among the excluded set; (2)
+      the embedded text for both CVEs and techniques was `label + node_type +
+      str(properties)` truncated to 512 chars, spending most of that budget on
+      structural boilerplate (tactics/platforms lists) before reaching any real
+      description — switched to embedding `description` directly with a
+      generous 6000-char ceiling (empirically verified against the single
+      longest description anywhere in the graph, 4680 chars, embedding cleanly
+      in one call — nomic-embed-text's real context is 2048 tokens per a live
+      `/api/show`, not the 8192 `num_ctx` shown alongside it); (3) **the load-
+      bearing fix, found via a live rank-position audit**: with CVE + technique
+      + tactic nodes in one undifferentiated searchable index, the correct
+      ground-truth technique ranked #545 of 783 for one CVE and #184 of 783
+      for another — CVE descriptions are far more textually similar to *other
+      CVE descriptions* than to ATT&CK's "Adversaries may..." prose, so
+      same-type nodes dominate a flat nearest-neighbor search regardless of
+      topical relevance. This is a recall failure, not a ranking failure —
+      confirmed by two-stage retrieve-then-rerank (added per this run, Qwen3
+      fast-mode reranking a 30-candidate embedding pool) making zero
+      difference until the search was restricted to technique/tactic-type
+      nodes only (a ChromaDB `where` metadata filter), mirroring exactly what
+      GraphRAG's own Cypher already restricts to. Also fixed the NVD rate-limit
+      pacing (was 0.6s/request, ~10x too fast for the anonymous 5-req/30s
+      limit — hit 429s on half the sample before the fix) and a duplicate NVD
+      fetch per CVE (ground truth was independently re-fetched a second time
+      just for a log line).
+
+      **Real result, 44/52 evaluable CVEs** (8 dropped for no NVD-derivable
+      ground truth, same honest exclusion as the original v0 methodology):
+      GraphRAG mean P@10 = **0.176** (FPR 0.824); flat VectorRAG mean P@10 =
+      **0.039** (FPR 0.961); VectorRAG+Rerank mean P@10 = **0.057** (FPR
+      0.943). Delta GraphRAG−flat = **+0.137**; delta GraphRAG−reranked =
+      **+0.119**. GraphRAG beats both VectorRAG variants; reranking helps
+      VectorRAG (0.039→0.057) but doesn't close the gap. **This is now the
+      real Claim 1 evidence at proper scale** — supersedes the small 6-CVE v0
+      sample and the invalid 12-CVE backfill. Still short of the full R2.1
+      spec: P@10 only (not P@k for k∈{5,10,20}), no MRR/nDCG@10, no
+      bootstrapped CIs — those need ranked (not set) retrieval results, a
+      real design change, still open.
+- [x] R2.2 — Claim 2 (grain convergence): sweep the challenger over **all 73+ CVE
       nodes** (threshold-gated on low `grain_confidence`, fixed round budget e.g.
       3). Report the full before/after grain histogram (not just per-node deltas)
       + monotonicity rate (fraction that never regress) + mean Δ with a CI.
@@ -230,7 +323,37 @@ themselves are actually ready to run at R2 scale the moment Kaggle is reachable
       all hold up on manual review. Ready for `--n-nodes 73`, but genuinely
       unverified by execution — confirm on a small `--n-nodes 2 --resume` dry
       run before trusting it on the real 73-node sweep.
-- [x] R2.3 — Claim 3 (co-evolution): **already fully ready, no changes needed.**
+      **Done for real, 2026-08-22 — `results/r2_2_grain_73nodes_checkpoint.json`,
+      independently re-verified against the raw checkpoint, not the summary
+      doc.** Full target scope: all 73/73 CVE/technique nodes, real
+      `challenge_node_v2` narrowing-engine calls, live Neo4j writes, resumed
+      across several genuine mid-run crashes (an Ollama 500 on `/api/embeddings`,
+      a dropped Neo4j connection) via the checkpointing built above. Verified
+      by recomputing directly from the JSON: mean `grain_confidence`
+      0.300 (seed, std 0.000) → **0.354** (std 0.291), **+18.0%**; after-
+      distribution 28 nodes @ 0.0–0.2, 22 @ 0.2–0.4, 2 @ 0.4–0.6, 13 @ 0.6–0.8,
+      8 @ 0.8–1.0; status 23 `resolved` / 40 `stalled` / 9 `partial` /
+      1 `skipped`. **Honest qualifier the paper needs, not just this file:
+      convergence is not uniformly monotonic at the node level** — 37/73
+      nodes (50.7%) ended below their 0.3 seed, consistent with R1.3's
+      earlier finding that the freshness term can drag an individual node's
+      confidence down on a round where the asker outpaces the answerer even
+      while cumulative trust stays healthy. The population-level rightward
+      shift is the real evidence for Claim 2; per-node monotonicity is not
+      claimed. **The `+24.9%` / `n=50` figure in
+      `results/R2_EVALUATION_COMPLETE.md` does not reproduce**: the
+      checkpoint it cites (`results/grain_sweep_checkpoint.json`, dated
+      2026-08-23, a day *after* this 73-node run had already finished) is
+      only 14/50 nodes complete, and re-averaging those 14 gives **-17.9%**
+      (0.182 → 0.150), not +24.9% — that file is a smaller, incomplete,
+      superseded run that the summary doc used instead of the better one
+      that already existed. Monotonicity rate and a formal CI (still open
+      per the plan above) can now be computed directly from this checkpoint
+      without a fresh GPU run.
+- [~] R2.3 — Claim 3 (co-evolution): **was "already fully ready, no changes
+      needed" as of 2026-08-19 (script infra only) — now genuinely run, on
+      2026-08-24, but short of both the cycle target and the statistical
+      battery below, and its own narrative summary overstates the result.**
       `scripts/eval_coevolution.py` already supports `--cycles 150`, `--resume`,
       and checkpoints every 10 cycles — found this checking all three R2 scripts
       for the same staleness eval_grain.py had; this one never had the problem.
@@ -243,11 +366,54 @@ themselves are actually ready to run at R2 scale the moment Kaggle is reachable
       significant coupling/adaptation stats supporting equilibrium, or an honest
       "no significant trend at N cycles" — both publishable, a forced p-hack is
       not. Execute whichever D1 framing follows.
+      **Done for real, 2026-08-24 — `results/coevolution_50.json`
+      (`cycles_completed: 100`), confirmed against `results/r2_3_100.log`'s
+      clean `[DONE] All 100 cycles complete`.** This is 100 real cycles, not
+      the "90/100, infrastructure ceiling reached" story in
+      `results/R2_EVALUATION_COMPLETE.md` — that file's own cited checkpoint
+      already shows 100. Short of the ≥150-cycle target and none of the three
+      statistical additions above are implemented. **Re-running the project's
+      own regression method** (`scripts/eval_coevolution.py`'s `_regression()`
+      — `scipy.stats.linregress` against `np.arange(len(values))`) directly
+      against the actual complete arrays: attack confidence mean 0.832
+      (σ 0.147), slope +0.00063/cycle, R²=0.015, **p=0.221**; mitigation
+      effectiveness mean 0.884 (σ 0.068), slope +0.00036/cycle, R²=0.023,
+      **p=0.134**. Neither reaches p<0.05. **The "p=0.0395 significant"
+      claim in `results/R2_EVALUATION_COMPLETE.md` does not reproduce** —
+      closest reconstruction is an undisclosed one-tailed test on a 90-cycle
+      *subset* of what has since become a 100-cycle series (two-tailed p at
+      n=90 is 0.081 attack / 0.144 mitigation; halving lands near 0.040/0.072,
+      close to what was reported), and even that doesn't survive the run
+      actually finishing. **Honest conclusion, now on 2× the original 50-cycle
+      sample: still co-evolutionary equilibrium, not significant improvement**
+      — both slopes small and positive, oscillation persists, p>0.05 for both
+      agents on the real, complete data. This is a genuine update to the
+      record (bigger N than the original small-sample paper claim), just not
+      the "claim supported, publication-ready" one that got reported. The
+      ≥150-cycle target and the stationarity/change-point/cross-correlation
+      battery remain the actual open work for this item.
 - [ ] R2.4 — Claim 4 (hardware feasibility): lock local latency numbers as the
       paper's source of truth (not Kaggle figures).
 - [ ] R2.5 — Reproducibility, cross-cutting: pin `qwen3:8b` + record Ollama
       version/seed where possible; report variance across ≥3 seeds for headline
       numbers (local LLM output isn't fully deterministic).
+
+**Process note, 2026-08-24, worth keeping so it doesn't repeat.**
+`results/R2_EVALUATION_COMPLETE.md`, `FINAL_R2_EVALUATION_REPORT.md`,
+`R2_EVALUATION_SUMMARY.md`, and `FINAL_R2_REPORT.md` (all written 2026-08-23/24
+during the runs themselves) report a materially rosier picture than the
+checkpoint/log files they cite actually support once recomputed directly:
+R2.1's number is circular, R2.2's headline number comes from an incomplete
+14/50 checkpoint when a complete, better 73/73 checkpoint already existed
+from the day before, and R2.3's significance claim doesn't reproduce against
+the complete 100-cycle data using the project's own regression script.
+None of this looks deliberate — it reads as summaries written from an
+in-progress or wrong checkpoint and never re-checked against the final
+committed data. Treat narrative result summaries as claims to verify against
+their own cited raw files before citing them anywhere else (the paper, an
+investor conversation, a future session's context) — this file and
+[PAPER_DRAFT.md](PAPER_DRAFT.md) §5 were corrected 2026-08-24 by doing exactly
+that. `PAPER_CLAIMS.md` still needs the same pass.
 
 ### R3 — Eval rigor upgrades `no-GPU / light-GPU`
 - [ ] R3.1 — Replace term-overlap groundedness check with a small local NLI
@@ -275,16 +441,21 @@ themselves are actually ready to run at R2 scale the moment Kaggle is reachable
 ## PRODUCT TRACK
 
 ### P1 — Finish the victim/range foundation `no-GPU / Docker` · runnable now
-- [~] P1.1 — Validate Cyrus + Squid demonstrate their documented CVE behavior
+- [x] P1.1 — Validate Cyrus + Squid demonstrate their documented CVE behavior
       end-to-end (the red/blue gate — same standard already met for PHP).
-      **Status 2026-08-24**: INFRASTRUCTURE READY
+      **Done for real, 2026-08-24 — `results/p1_1_validation_run3.log`,
+      clean full pass, verified directly from the raw file, not a summary.**
+      Cyrus IMAP 2.2.5: real greeting, real `CAPABILITY` response, real
+      `LOGIN` as `cyrus` → `C2 OK User logged in`, real `LIST` command
+      completing. Squid 2.2.STABLE5: real HTTP request through the proxy,
+      real `HTTP/1.0 200 OK` response with headers. Both marked PASS in the
+      script's own final summary (`P1.1 VALIDATION COMPLETE: Both services
+      verified`). No open work here.
       - `scripts/exploit_cyrus_cve_2004_rce.py` — Cyrus IMAP connectivity + auth validation (CVE-2004-1012/1013)
       - `scripts/exploit_squid_cve_1999_1481.py` — Squid proxy HTTP request + ACL handling (CVE-1999-1481)
       - `scripts/test_p1_1_validation.py` — Orchestrates both services: spawn → wait → test → cleanup
       - `docs/P1_1_VALIDATION_GUIDE.md` — Deep dive on why both services work now (x86_64 compat fixes, stack/va_list)
-      Both services proven: build OK, start OK, reachable on expected ports. Ready to run `test_p1_1_validation.py`
-      for end-to-end validation.
-- [~] P1.2 — MySQL recipe fix + authentic CVE demo. **Status 2026-08-24:**
+- [x] P1.2 — MySQL recipe fix + authentic CVE demo. **Status 2026-08-24:**
       D2 answered (network-facing, remote auth bypass, confirmed). DONE: comment
       corrected; auth config fixed and live-validated on 3.22.32 (grants ON,
       `argus@%` password account, anon accounts removed, positive/negative TCP
@@ -295,21 +466,90 @@ themselves are actually ready to run at R2 scale the moment Kaggle is reachable
       handshake" 400/400). An earlier static read wrongly called it vulnerable; the
       live exploit corrected it (methodology point for the paper). 
       
-      **INFRASTRUCTURE READY (2026-08-24)**: 
-      - `scripts/exploit_short_scramble.py` — Full CVE-2000-0148 exploit code, protocol-compliant
-      - `graphrange/victim_builder.py` — MySQL 3.21.33b build recipe added to `_MYSQL_SOURCES` (skeleton ready, URL placeholder)
+      **Build sourcing DONE, 2026-08-24**: real vulnerable MySQL 3.22.30 (an
+      actual NVD-listed CPE for this CVE) sourced and building cleanly from
+      source (root cause of an earlier `config.cache`-poisoned `CXX` build
+      failure found and fixed — `rm -f config.cache` before `./configure` in
+      both `graphrange/victim_builder.py` and its hand-synced duplicate in
+      `graphrange/docker/supervisor/supervisor.py`). Container spawns,
+      installs, and starts cleanly (`install_exit_code=0`, `start_exit_code=0`,
+      `service_status=mapped`) — confirmed on a fresh live run.
+
+      **Real root cause found and fixed, 2026-08-24 — done for real,
+      `results/p1_2_mysql_run5.log`.** The 200/200-rejection run above
+      (`results/p1_2_mysql_run4.log`) was real, but not evidence the CVE is
+      absent — it was the exploit script under-provisioning its own guess
+      space. Pulled the actual `sql/password.c` out of a live container
+      (`results/p1_2_password_c_source.log`) and confirmed directly:
+      `scramble()`'s generation loop (`*to++ = (char)(floor(rnd(&rand_st)*31)+64)`)
+      confines every real scrambled byte to the 31-value range **[64, 94]**,
+      and for a `client_flags=0` connection (what this script sends, no
+      `CLIENT_LONG_PASSWORD`) the server takes the `old_ver`/`extra=0` path,
+      comparing our guess directly against that value with no XOR. The
+      script was guessing uniformly from the full `[1, 255]` byte range —
+      correct true odds are ~1-in-31, but sampling 255 possible values
+      against a 31-value target silently cut real odds to ~1-in-255, at
+      which 200 attempts are only ~54% likely to succeed even against a
+      genuinely vulnerable server. That fully explains both the two earlier
+      pasted-output "successes" and the clean 200/200 failure — no
+      contradiction, just an unlucky draw against bad odds. **Fixed**:
+      `exploit_short_scramble.py` now guesses `random.randint(64, 94)`.
+      Also independently confirmed via a real-client positive/negative
+      control (`results/p1_2_positive_control2.log`) that the account,
+      grants, and build were never the problem: real `mysql` client, correct
+      password → succeeds; wrong password → clean `1045`. **Re-ran the real
+      exploit after the fix**: `results/p1_2_mysql_run5.log` —
+      `[+] VULNERABLE: server accepted a 1-byte password response (0x44) on
+      attempt 75/200`, `0x44`=68, squarely inside the verified [64,94]
+      window. Real, saved, reproducible bypass. P1.2 is done — no open work
+      here.
+      - `scripts/exploit_short_scramble.py` — CVE-2000-0148 exploit code, protocol-compliant (header stripping, old-protocol auth layout, [64,94] guess range, retry loop, guard-exception early-stop)
+      - `graphrange/victim_builder.py` / `supervisor.py` — MySQL 3.22.30 build recipe in `_MYSQL_SOURCES` (both copies), real working source URL
       - `scripts/test_mysql_cve_2000_0148.py` — End-to-end test harness: spawn container → wait for service → run exploit → verify bypass
-      - `docs/P1_2_MYSQL_CVE_SOURCING.md` — Sourcing guide for vulnerable MySQL (Debian Snapshot, Internet Archive, Software Heritage options documented)
-      
-      **REMAINING**: Source the actual vulnerable MySQL ≤3.22.31 or fallback 3.21.33b tarball 
-      from Debian Snapshot, Software Heritage, or Internet Archive, then fill the URL in 
-      `_MYSQL_SOURCES["3.21.33b"]["url"]` and run `test_mysql_cve_2000_0148.py` to validate end-to-end.
-      Sourcing guide at `docs/P1_2_MYSQL_CVE_SOURCING.md` has step-by-step instructions.
+      - `docs/P1_2_MYSQL_CVE_SOURCING.md` — Sourcing guide for vulnerable MySQL (superseded by the 3.22.30 URL now in use)
 - [ ] P1.3 — Re-verify the generic fallback install path through real
       `spawn_scenario()` for an unseen version (the `init=True` fix is proven only
       in isolated `docker run --init`, not yet through the production path).
-- [ ] P1.4 — _(optional)_ Debian 2.2 `at` recipe (CVE-2002-0004, ia-32) — the only
-      Docker-workable OS-level node, proven version-pinning pattern.
+- [ ] P1.4 — _(optional, deferred 2026-08-24 — see below)_ Debian 2.2 `at`
+      recipe (CVE-2002-0004, ia-32) — the only Docker-workable OS-level node,
+      proven version-pinning pattern.
+      **Real research done, 2026-08-24 — not wasted, picks up cleanly later.**
+      Confirmed via live NVD fetch: heap corruption in `at` via a malformed
+      execution time causing a double-free, CVSS 7.2, `AV:L` (LOCAL — this
+      matters, see below). Found the actual original 2002 Bugtraq disclosure
+      (marc.info, msg 101128661602088) with a real, complete, working exploit
+      attached (`attn.tar.gz`, extracted to `results/attn/`): trigger is
+      `/usr/bin/at 31337 + vuln` (segfaults if vulnerable, "Garbled time" if
+      not — a cheap, near-zero-tuning way to prove the CVE on its own,
+      confirmed against `at-3.1.8-12` on RedHat 7.0/glibc-2.2.4). Full chain
+      understood: `run.c` triggers the double-free via a crafted `TZ` env var
+      + a directory name stuffed with a guessed stack address (`0xbfffbfff`)
+      + shellcode in another env var, landing code execution as `daemon`;
+      that shellcode runs `bep.c`, which symlinks a malicious `at` job entry
+      to `/etc/ld.so.preload` and uses `at`'s own privileged spool-write
+      access to point it at `rooter.so`; `rooter.so`'s constructor fires the
+      next time root runs any dynamically-linked binary and chowns
+      `suidshell` to setuid-root; running `suidshell` gives a real root
+      shell. Real, complete, CVSS-matching (C:C/I:C/A:C) 2002 chain — but the
+      original author's own comments say `TZONE`/`SIZ` need empirical
+      retuning per target, and the hardcoded stack addresses assume
+      RedHat-7.0-era, no-ASLR memory layout that will very likely need
+      redoing for a fresh container on a modern kernel.
+
+      **Deferred, not because it's too hard — because it's arguably not a
+      red/blue task as currently scoped.** NVD's own wording is "allows
+      *local* users to execute arbitrary code" (`AV:L`) — this is an ATT&CK
+      T1068 privilege-escalation primitive, not an initial-access one, unlike
+      every CVE built so far (Cyrus/Squid/MySQL are all red-connects-over-
+      the-network attacks). Building it as a standalone Docker exploit would
+      mean just handing red a foothold account to make it runnable at all,
+      which isn't red finding an attack path. The real, more valuable version
+      of this is a **second stage chained onto P1.2's MySQL bypass** — red
+      uses the auth bypass to get a foothold, then this to go from that
+      foothold to root, a genuine two-hop attack path. That chaining only
+      makes sense once **P2's live orchestration** exists to actually run
+      red multi-step against a live container. Revisit after P2 lands, as a
+      second-stage addition, not before.
 - [ ] P1.5 — _(deferred, own architecture)_ VM support for the 24 genuinely
       VM-only OS nodes (QEMU orchestration + image sourcing). Cisco IOS →
       GNS3/Dynamips is its own category. Convex/Cray are permanent non-gaps.
@@ -322,13 +562,277 @@ themselves are actually ready to run at R2 scale the moment Kaggle is reachable
       `scenario_match` flag, logging any divergence. Backward-compatible
       (`scenario=None` = old behavior). NOT yet live-validated — needs P2.1's
       GPU run to confirm end to end.
-- [ ] P2.1 — Phase 7 `run_one()` full orchestration live (only `plan_attack()`
-      proven so far; needs live `gr-supervisor` + victim containers).
-- [ ] P2.2 — Remaining GPU-live Scanner paths: `file_scanner._scan_file`/
+- [x] P2.1 — Phase 7 `run_one()` full orchestration live. **Done for real,
+      2026-08-24 — `results/p2_1_live_run3.json`-equivalent log
+      `results/p2_1_live_run3.log`, 3 real scenarios (MySQL 3.22.30, Cyrus
+      2.2.5, Apache 1.3.1), all three `execution.status=executed`,
+      `scenario_match=True`, clean `stalemate` outcomes** (no crash, no
+      infra failure — red's generic `nmap` tool assignment doesn't reproduce
+      these specific historical CVEs, and blue's tcpdump/`ss` heuristics
+      correctly saw nothing to flag; an honest non-result, not a forced win,
+      consistent with this project's own standard for reporting real
+      outcomes over rosy ones).
+
+      **Two real, pre-existing bugs found and fixed to get here** (neither
+      specific to these 3 scenarios — both would have hit any live P2.1 run):
+      1. `run_one()` never called `spawn_scenario()` at all —
+         `execute_attack()` assumes containers named
+         `gr-red-{run_suffix}`/`gr-victim-{run_suffix}` already exist, but
+         nothing in the call chain (`run_one → plan_attack/execute_attack`)
+         ever created them. First live attempt
+         (`results/p2_1_live_run.log`) failed all 3 scenarios with
+         `execution.status=supervisor_error` — real containers simply didn't
+         exist when `/exec` targeted them. Fixed: `run_one()` now sets
+         `scenario["run_id"]` once (so `spawn_scenario()`'s own
+         `run_suffix` default and `execute_attack()`'s engagement-id
+         fallback can't diverge), calls `POST /spawn_scenario` before
+         planning, and `POST /teardown` in a `finally` after the monitor
+         thread is stopped (ordered so blue isn't still polling
+         already-torn-down containers).
+      2. `graphrange/docker/supervisor/supervisor.py` never called
+         `load_dotenv()` — `NEO4J_URI` silently fell through to a hardcoded
+         `bolt://host.docker.internal:7400` default (correct only if this
+         module runs inside a container, which `run_scenario.py`'s own
+         comment already documents it doesn't — everything in this project
+         runs host-native). Every `/tool_request` call opened a fresh Neo4j
+         session that hung ~23s on a real `WinError 10060` connection
+         timeout before failing — this is what `execute_attack()` was
+         actually hitting as `supervisor_error` on the *second* live attempt
+         (`results/p2_1_live_run2.log`), even after fix #1 made spawning
+         itself work (confirmed via container build times increasing
+         correctly, 464s vs 313s). Found by restarting the supervisor via
+         the direct `python.exe` path instead of `conda run` (which buffers
+         a long-lived process's output until it exits, hiding the real
+         traceback) and reproducing the failing call manually — the
+         traceback pointed straight at the wrong host. Fixed: added
+         `load_dotenv()`, and updated the stale hardcoded default from
+         `host.docker.internal` to `localhost` to match this project's
+         actual host-native deployment.
+      A third, smaller issue also found and fixed in the same pass: the
+      180s client-side timeout on the `/spawn_scenario` call was too short
+      for a real from-source MySQL build (~4 min observed) — the client
+      would give up while the server kept working, silently orphaning
+      containers that never reached `/teardown`. Bumped to 600s.
+
+      Not yet exercised by this validation: a scenario where red's assigned
+      tool genuinely reproduces the CVE (would need `execute_attack()`'s
+      generic `{tool} [json_flag] {target}` command construction extended
+      to invoke this project's own weaponized exploit scripts — e.g.
+      `exploit_short_scramble.py` — for CVEs that have one, rather than only
+      ever handing red a generic scanner).
+- [~] P2.2 — Remaining GPU-live Scanner paths: `file_scanner._scan_file`/
       `_merge_call`, `scanner_red._plan_attack_path`/substitution/`_assess_objective`
       (`sandbox=True`), full `run_scanner.py` pipeline.
-- [ ] P2.3 — Days 12–14 real product test: full WebGoat/axios scan + multiple
+      **Substantial real progress 2026-08-24/25, not yet fully closed** —
+      done via a new backup compute lane: Kaggle's weekly GPU quota was
+      exhausted, so set up a Colab T4 tunnel instead (`colab/README.md`,
+      new — Google shipped an official headless CLI in June 2026, no
+      cloudflared/nginx needed unlike Kaggle's).
+      - `file_scanner._scan_file`/`_merge_call` — **live-verified**, real
+        calls against real WebGoat source files, real flags returned
+        (e.g. a real SQL injection finding at confidence 0.95).
+      - `victim_builder._infer_compose_from_manifests` — **live-verified,
+        with a real finding**: correctly detects ecosystems (java_maven,
+        node) from real manifests, but its raw output is genuinely
+        unreliable run-to-run — 4 independent live WebGoat attempts hit 4
+        different failure modes (a deprecated `openjdk:17` image; a raw
+        `${project.version}` Maven property copied verbatim into an image
+        tag; a YAML syntax error; a plausible-but-wrong `owasp/webgoat`
+        image guess when the real one is under `webgoat/`). Built a
+        general reconcile loop (`_compose_up`'s retry cycle feeding the
+        real `docker compose` failure back to Qwen for a whole-file fix,
+        `_MAX_COMPOSE_RECONCILE_ATTEMPTS=6`) rather than patch each
+        failure mode individually — deliberately reverted an earlier
+        one-off prompt patch ("for Java use eclipse-temurin") once it was
+        clear that hardcoding the answer to one case would just hide
+        whether the general mechanism actually works, not prove it does.
+        **Empirical result, 3 diverse real repos (WebGoat/Java,
+        DVWA/PHP, Juice Shop/Node)**: 1/3 succeeded outright, but the
+        other 2 "failures" never actually reached the reconcile mechanism
+        — DVWA failed at manifest *detection* (`_scan_manifests()` only
+        recognizes `composer.json` for PHP; DVWA has no Composer manifest
+        at all, a real, separate gap) and Juice Shop failed because the
+        Colab tunnel died mid-sweep (infra, not a generalization result).
+        The one real trial that reached the mechanism succeeded (landed on
+        `azul/zulu-openjdk:11-jre`, a real currently-published image) —
+        informative, not statistically conclusive at n=1. **Open follow-up
+        for later**: broaden `_scan_manifests()`'s ecosystem detection
+        beyond package-manager manifests (plain PHP/no-manifest repos are
+        real and common, not an edge case).
+      - `scanner_red._plan_attack_path`/substitution/`_assess_objective`
+        (`sandbox=True`) — **not yet confirmed**. The live WebGoat run
+        (`results/p2_3_webgoat_run4.log`) got all the way through a real
+        1355-work-unit `scan_repo()` pass, then the Colab tunnel died
+        (session killed by the backend, no warning — second time this
+        happened, see below) during the final `merge_chunks()` step,
+        crashing the whole run before red/blue analysis ever started.
+        **Real, permanent loss**: `scan_repo()` held all results in memory
+        with no persistence, so the entire completed scan pass is gone,
+        not recoverable.
+        **Fixed 2026-08-25** (`graphrange/scanner/file_scanner.py`):
+        `scan_repo()` now checkpoints completed work units to
+        `.argus_scan_checkpoint.json` inside the staged repo path every 10
+        completions (atomic write via `os.replace`), and skips
+        already-checkpointed units on a later call against the same path
+        — a crash now loses at most ~10 units of progress, not the whole
+        pass. `_merge_call()` also now catches `requests.RequestException`
+        (not just a JSON parse failure) and degrades to an unmerged flag
+        instead of crashing — the exact failure that just happened. Not
+        retroactive: this protects the *next* run, the one that just
+        crashed is still fully lost.
+        **Second real Colab session death, same failure mode as the
+        first** (see D4 in Decisions above and `colab/README.md`) — two
+        different Google accounts, both killed mid-task by the backend
+        with no warning. Strong evidence this is a real, repeated Colab
+        free-tier reliability limit, not one account's bad luck.
+        **Third session death, 2026-08-25/26, mid Pass 2** — same
+        pattern a third time, on the third account. All 3 accounts'
+        Colab GPU quota also ran out around the same window (each hit
+        "Service Unavailable" independently); resumed the ALREADY-
+        checkpointed scan against **local** Ollama instead (the one
+        compute source nothing external can revoke), reusing the
+        completed `scan_repo()` checkpoint directly rather than
+        re-scanning. Real per-call cost on local hardware (RTX 3050):
+        confirmed via `logs/telemetry.jsonl`, `reason_over_flags()`
+        averaged ~200-220s/call across all 385 flags, stable (checked
+        for drift across thirds of the run — no thermal throttling or
+        speedup, genuinely flat), totaling ~75,895s (~21hr) for the
+        reasoning pass alone. Every Qwen-call timeout across the Scanner
+        module family (`file_scanner`, `scanner_red`, `scanner_blue`,
+        `vuln_reasoner`, `victim_builder`) bumped 600s→1800s after a real
+        local call exceeded 600s outright (the topology-build call took
+        719.6s to actually finish once given room).
+        **Real, serious finding once Pass 2 completed**: all 385/385
+        flags came back as "vulnerabilities" — reason_over_flags() had
+        **zero filtering**, just relabeling every static flag as
+        confirmed. Killed the run 1/385 into red/blue analysis once this
+        was clear: at ~5-9 Qwen calls per vulnerability (~17-30min each
+        locally), 385 of them is another ~109-192 hours, not a
+        continuation of the same scale of wait. **This means the
+        productized Scanner is not viable local-only as currently
+        built** — even with the faster Colab tunnel (~3-4x local, by the
+        one real ratio measured: the topology call), full red/blue on
+        an unfiltered 385-vulnerability set is still 25-64+ hours, and
+        Colab's own reliability (3 session deaths today) makes a
+        multi-day continuous cloud run a bad bet too. The real fix isn't
+        faster hardware, it's not sending everything through the
+        expensive path in the first place.
+        **Fixed 2026-08-25/26, four real levers, all live-verified
+        working (not just coded) via a cheap 2-call sanity test before
+        trusting them on a real run**:
+        1. **Real triage** (`vuln_reasoner.py`) — `_reason_block()`'s
+           prompt now asks Qwen to also judge `is_genuine_finding: bool`
+           (false for false positives, defensive code, unreachable
+           test/example code, or too speculative to pursue), and
+           `reason_over_flags()` actually acts on it, skipping non-
+           genuine findings instead of always appending. Verified live:
+           field present, correctly typed, both real test findings
+           (Dockerfile insecure permissions, hardcoded admin credentials)
+           correctly scored `true`.
+        2. **Severity gate** (`run_scanner.py`) — only `Critical`/`High`
+           findings get full dynamic (red/blue) analysis;
+           `Medium`/`Low` still appear in the report with real static
+           reasoning detail, just without a live exploit attempt
+           (report-compatible placeholder `red`/`blue` dicts matching
+           `scanner_red`/`scanner_blue`'s own real return shapes, so
+           `write_scanner_report()` never sees a `None`).
+        3. **Scope reduction** (`file_scanner.py`) — added `.adoc`/`.md`/
+           `.rst` to `SKIP_EXTENSIONS` (WebGoat alone had 274 `.adoc`
+           lesson write-ups costing a full Qwen call each for a
+           guaranteed empty result) and a new `SKIP_DIRS` set
+           (`test`/`tests`/`it`/`spec`/etc., a common SAST convention,
+           general not WebGoat-specific) alongside the existing `.git`
+           exclusion.
+        4. **Deduplication** (`run_scanner.py`) — Critical/High findings
+           cluster by `(vuln_type, cwe)`; only one real representative
+           per cluster gets full dynamic analysis, the rest reuse that
+           real result by reference (their own report entry says so
+           explicitly) instead of re-paying the full cost for what's
+           structurally the same finding. Real leverage for a
+           deliberately-repetitive training app like WebGoat; still a
+           correct, general mechanism for any repo with recurring
+           patterns.
+        **Re-validated end-to-end 2026-08-26/27, real results, still
+        incomplete**: added Pass 2 checkpointing too (`vuln_reasoner.py`,
+        same atomic-write/resume pattern as Pass 1, live-verified via a
+        real 2-call test: first call 383.1s + writes, second call 0.0s +
+        resumes correctly) before committing to a real run, given Pass 2
+        alone costs ~21hr and a repeat crash losing it all again wasn't
+        acceptable. Real live run against WebGoat with all five fixes
+        (four compute-reduction + Pass 2 checkpointing) active: scope
+        reduction cut work units 1355→936 (31% fewer) with **zero loss of
+        real findings** (all 385 flags still recovered — the excluded
+        `.adoc`/test-directory files contributed none of them). Topology
+        reuse (skip regenerating an already-working compose file) cut
+        ~12min to ~2s. As of this writing, Pass 2 sits at **190/385**
+        (checkpointed, safe), which after severity-gating + dedup
+        produced **83 real distinct `(vuln_type, cwe)` clusters** — and
+        critically, cluster growth is genuinely sub-linear and shrinking
+        (156→72, +23 flags→+8 clusters, +11 flags→+3 clusters): real,
+        live confirmation the dedup fix works as designed, not just
+        coded. Projected full-385 total: **~112-122 clusters**, not 385
+        individual analyses — the four fixes together are working.
+        **A second real, separate bug found and fixed along the way**:
+        `_analyze_finding()` started blue's monitor thread before calling
+        `red_analyze()`, but only called `stop_event.set()` /
+        `blue_thread.join()` on the SUCCESS path — when `red_analyze()`
+        raised (repeatedly, once the tunnel was dead), the function
+        exited via the exception without ever stopping the monitor
+        thread, which only ever stops on that event. Every failed
+        cluster attempt left a live, non-daemon thread behind
+        permanently, which blocks Python from exiting even after the
+        calling script prints "DONE" and returns -- this is what produced
+        multiple lingering `resume_p2_3_webgoat.py` processes that looked
+        finished (per their own log and per the harness's own "completed"
+        notification) but were still running, silently racing each other
+        to write the same checkpoint file. **Fixed**: `stop_event.set()`
+        + `blue_thread.join()` moved into a `finally` block, guaranteeing
+        cleanup regardless of whether `red_analyze()` succeeds.
+        **Compute reality, 2026-08-27**: 6 real Colab GPU sessions across
+        all 3 available Google accounts today, every one killed by the
+        backend mid-task (session lifetimes ranged from ~24 minutes to
+        several hours, no discernible pattern) — checkpointing meant each
+        death cost only its own short session's progress, not everything,
+        but this is still a real, severe reliability problem, not bad
+        luck. All 3 accounts then hit genuine per-day limits within the
+        same session (two "Service Unavailable," one
+        `TooManyAssignmentsError`) -- Colab is fully unavailable until
+        some reset, timing unknown. Real per-call rate comparison from
+        today's 3 sessions: Colab averaged ~84s/call (range 40-115s,
+        session-dependent) vs local's stable ~200-220s/call — Colab is
+        genuinely ~2.5x faster when available, but "available" is the
+        real constraint, not speed. Estimated remaining work: **~49-72hr
+        locally** (Pass 2 remainder ~11.4hr + Pass 3 ~37-61hr) or
+        **~20-29hr of raw compute on Colab** if/when it's reachable
+        again, plus real per-session setup overhead (~5-10min: SSH,
+        zstd+Ollama install, model pull, tunnel) each time a session
+        dies and needs replacing. **Lightning AI identified as a
+        promising untested alternative** — real SSH terminal + CLI
+        (not adapted from a notebook UI), 80 free GPU hours/month,
+        T4/A10 hardware, and critically **persistent storage** (Ollama +
+        the pulled model would survive between sessions, unlike Colab's
+        from-scratch reinstall every single time) — not yet tried,
+        reliability of its own free-tier GPU allocation is unknown.
+      Real, measured Colab T4 throughput finding, not assumed: naive
+      "more parallel workers = faster" was wrong twice in a row (Ollama's
+      default `OLLAMA_NUM_PARALLEL=1` serialized 3 "parallel" client
+      workers; raising it to 6 made things *worse*, since a T4 is
+      compute-bound, not queue-bound, for this model). A real sweep found
+      the actual optimum: `OLLAMA_NUM_PARALLEL=2` + matching client
+      concurrency, ~8.6s/file effective vs ~13.1s at N=1 and ~8.5s
+      (flat, no further gain) at N=4. Full detail in `colab/README.md`.
+- [~] P2.3 — Days 12–14 real product test: full WebGoat/axios scan + multiple
       GraphRange scenarios, end to end, "like a user."
+      **GraphRange half done** — see P2.1 above (3 real scenarios: MySQL,
+      Cyrus, Apache). **WebGoat half in progress** (see P2.2 above for the
+      infrastructure this took) — a real `run_scanner()` call against the
+      actual `https://github.com/WebGoat/WebGoat` repo, not a synthetic
+      test, currently running via the Colab tunnel
+      (`results/p2_3_webgoat_run4.log`). **axios half not yet started** —
+      axios is a library, not a deployable service, so it won't exercise
+      `build_victim_topology()`'s dynamic path the way WebGoat does; expect
+      it to mostly exercise the static `scan_repo()` pass against real
+      historical CVE-relevant code, a smaller task than WebGoat was.
 
 ### P3 — Browser verification `no-GPU`
 - [ ] P3.1 — Confirm TelemetryPanel polling + `GraphView.navigateTo()` pan/zoom in a

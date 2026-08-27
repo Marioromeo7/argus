@@ -18,7 +18,11 @@ from graphrange.telemetry import track, count_tokens, patch_last_tokens_out
 from config import OLLAMA_CHAT_URL as OLLAMA_URL
 
 QWEN_MODEL = "qwen3:8b"
-CALL_TIMEOUT = 600  # was 90s -- too tight given this hardware's real observed latency
+CALL_TIMEOUT = 1800  # was 600s -- still too tight, found live 2026-08-25: a
+                      # comparable-scale Qwen call on local hardware (RTX
+                      # 3050, ~8 tok/s, the only compute left after Colab's
+                      # quota ran out on all 3 accounts) exceeded 600s
+                      # without finishing
 MONITOR_POLL_SECONDS = 3
 MONITOR_JOIN_TIMEOUT = 30
 

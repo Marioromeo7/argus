@@ -88,15 +88,66 @@ def _infer_role(service_name: str, ports: list, image: str) -> str:
     return "unknown"
 
 
-def _infer_compose_from_manifests(manifest_map: dict) -> str:
+def _extract_docker_hints(repo_path: str, max_chars: int = 3000) -> str:
+    """ARGUS-SCANNER: Looks for real, documented `docker run`/`docker
+    compose` examples in the repo's own README before Qwen ever has to
+    guess blind from manifest files. Found live 2026-08-25: across 5
+    separate real WebGoat attempts, Qwen guessed at the right Docker setup
+    from `pom.xml` alone and got it wrong 5 different ways (a deprecated
+    image, a raw Maven property copied into an image tag, YAML syntax
+    errors, a plausible-but-wrong `owasp/webgoat` org guess, and trying to
+    `docker build` from the repo's own Dockerfile without ever running the
+    Maven build it needs) -- meanwhile WebGoat's actual README documents
+    the correct, official, pre-built image directly:
+    `docker run ... webgoat/webgoat`. Most public-facing repos, especially
+    training/vulnerable apps meant for outside users, document the real
+    way to run them precisely because they can't assume local build
+    tooling -- this is general, not WebGoat-specific: any repo with real
+    Docker docs in its README benefits, and it costs nothing when a repo
+    has no such docs (returns "")."""
+    for name in ("README.md", "README.rst", "README"):
+        path = os.path.join(repo_path, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        blocks = [
+            block.strip() for block in re.findall(r"```[a-zA-Z]*\n([\s\S]*?)```", text)
+            if re.search(r"\bdocker\b", block, re.IGNORECASE)
+        ]
+        return "\n---\n".join(blocks)[:max_chars]
+    return ""
+
+
+def _infer_compose_from_manifests(manifest_map: dict, docker_hints: str = "") -> str:
     """ARGUS-SCANNER: Qwen reasons over detected manifests to produce a
     docker-compose.yml wiring all application layers together. The one
     model call in this module -- everything else is pure detection/parsing.
-    Not live-tested as of writing (2026-08-10) -- holding at the same
-    live-GPU-call checkpoint as GraphRange Phase 7."""
+    Live-tested 2026-08-24 against a real WebGoat scan (Colab T4 tunnel):
+    correctly identified the java_maven ecosystem and wrote a structurally
+    valid compose file, but picked `openjdk:17` -- a real, deprecated/
+    removed Docker Hub image (confirmed via a live 404 against Docker
+    Hub's own API), since Qwen3 8B's training data predates the
+    deprecation. Deliberately NOT steering this prompt toward a specific
+    known-good image: the reconcile mechanism in _compose_up() (asks Qwen
+    for a replacement given the real failure, bounded retries) is the
+    actual general fix for stale image knowledge across any ecosystem --
+    hardcoding "for Java use eclipse-temurin" here would just be praying
+    the model resolves this ONE case, and would silently hide whether the
+    reconcile path itself actually works, since it'd never fire."""
+    hints_section = (
+        f"\nThe repository's own README documents real, working Docker "
+        f"commands for running it -- use these as your PRIMARY source of "
+        f"truth (the real image name/tag, real ports, real env vars) "
+        f"instead of guessing:\n{docker_hints}\n"
+        if docker_hints else ""
+    )
     prompt = (
         "Given these project manifest files from a single repository:\n"
-        f"{json.dumps(manifest_map)}\n\n"
+        f"{json.dumps(manifest_map)}\n"
+        f"{hints_section}\n"
         "Write a docker-compose.yml that:\n"
         "1. Creates one service per application layer detected\n"
         "2. Uses the correct base image and version for each\n"
@@ -114,7 +165,13 @@ def _infer_compose_from_manifests(manifest_map: dict) -> str:
             json={"model": QWEN_MODEL,
                   "messages": [{"role": "user", "content": f"/no_think\n\n{prompt}"}],
                   "stream": False},
-            timeout=600,
+            # 1800s, not 600s -- found live 2026-08-25: this exact call
+            # (compose-file generation, a larger output than most Qwen
+            # calls in this project) genuinely exceeded 600s on local
+            # hardware (RTX 3050, ~8 tok/s) without finishing, timing out
+            # the whole build_victim_topology() call. Real margin now that
+            # local is the only compute available.
+            timeout=1800,
         )
         resp.raise_for_status()
         raw = resp.json()["message"]["content"].strip()
@@ -122,9 +179,20 @@ def _infer_compose_from_manifests(manifest_map: dict) -> str:
     return re.sub(r"^```(?:ya?ml)?\s*|\s*```$", "", raw.strip())
 
 
+class _UnsafeComposeError(ValueError):
+    """ARGUS-SCANNER: Raised only for safety-boundary violations (unsafe
+    Docker flags, disallowed registries) -- these NEVER get reconciled/
+    retried, unlike syntax or image-resolution failures. A hard stop is
+    the correct behavior for a security boundary; looping an LLM against
+    it risks it just generating a different-but-still-bad workaround
+    rather than genuinely respecting the constraint."""
+
+
 def _validate_compose(compose_path: str) -> None:
     """ARGUS-SCANNER: Validates a compose file before it's ever run. Raises
-    ValueError on any failure -- called before every `docker compose up`,
+    _UnsafeComposeError for safety-boundary violations (never retried) or
+    plain ValueError for a syntax/config failure (reconcilable by
+    _compose_up's retry loop) -- called before every `docker compose up`,
     no exceptions."""
     result = subprocess.run(
         ["docker", "compose", "-f", compose_path, "config"],
@@ -137,7 +205,7 @@ def _validate_compose(compose_path: str) -> None:
         text = f.read()
     for flag in UNSAFE_FLAGS:
         if flag in text:
-            raise ValueError(
+            raise _UnsafeComposeError(
                 f"Unsafe flag '{flag}' in compose file -- isolation breach "
                 f"risk. Remove it and retry."
             )
@@ -150,23 +218,98 @@ def _validate_compose(compose_path: str) -> None:
         first_segment = image.split("/")[0]
         registry = first_segment if ("/" in image and "." in first_segment) else "docker.io"
         if registry not in ALLOWED_REGISTRIES:
-            raise ValueError(
+            raise _UnsafeComposeError(
                 f"Rejected: service {name!r} uses image {image!r} from "
                 f"disallowed registry {registry!r} (allowed: "
                 f"{', '.join(sorted(ALLOWED_REGISTRIES))})"
             )
 
 
+_MAX_COMPOSE_RECONCILE_ATTEMPTS = 6
+
+
+def _reconcile_compose(compose_text: str, error: str) -> str | None:
+    """ARGUS-SCANNER: General repair -- given a REAL compose
+    validation/up failure of any kind, asks Qwen to produce a corrected
+    version of the whole file. Same "try, fail, ask for a fix given the
+    real error" shape as scanner_red._request_tool_for_phase's
+    substitution fallback, but general rather than narrowly matched to one
+    failure class. Deliberately NOT pattern-matched to specific error
+    text: a live 2026-08-24 WebGoat run hit three genuinely different
+    failure modes across three separate attempts (a deprecated
+    `openjdk:17` image, an unescaped `${project.version}` Maven property
+    copied verbatim into the image tag, and a raw YAML syntax error) --
+    hardcoding a fix for each one discovered would only ever cover cases
+    already seen, never generalize to the next one."""
+    prompt = (
+        "This docker-compose.yml failed validation or failed to start:\n\n"
+        f"{compose_text}\n\n"
+        f"Real error:\n{error[:1500]}\n\n"
+        "Fix the file so it is valid and will actually run. Keep the same "
+        "overall structure and services where possible; change only what "
+        "the error requires.\n\n"
+        "Return ONLY the corrected docker-compose.yml content. No explanation."
+    )
+    tokens_in = count_tokens(prompt)
+    with track("scanner.victim_builder._reconcile_compose",
+               model="qwen", tokens_in=tokens_in, tokens_out=0):
+        resp = requests.post(
+            OLLAMA_URL,
+            json={"model": QWEN_MODEL,
+                  "messages": [{"role": "user", "content": f"/no_think\n\n{prompt}"}],
+                  "stream": False},
+            # 1800s, not 600s -- found live 2026-08-25: this exact call
+            # (compose-file generation, a larger output than most Qwen
+            # calls in this project) genuinely exceeded 600s on local
+            # hardware (RTX 3050, ~8 tok/s) without finishing, timing out
+            # the whole build_victim_topology() call. Real margin now that
+            # local is the only compute available.
+            timeout=1800,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["message"]["content"].strip()
+    patch_last_tokens_out(count_tokens(raw))
+    fixed = re.sub(r"^```(?:ya?ml)?\s*|\s*```$", "", raw.strip())
+    return fixed or None
+
+
 def _compose_up(compose_path: str) -> None:
     """ARGUS-SCANNER: Validates then brings up a compose file -- the only
-    path anything in this module uses to actually run containers."""
-    _validate_compose(compose_path)
-    result = subprocess.run(
-        ["docker", "compose", "-f", compose_path, "up", "-d"],
-        capture_output=True, text=True, timeout=300,
-    )
-    if result.returncode != 0:
-        raise ValueError(f"docker compose up failed: {result.stderr.strip()}")
+    path anything in this module uses to actually run containers. Retries
+    up to _MAX_COMPOSE_RECONCILE_ATTEMPTS times on ANY real validation or
+    startup failure (syntax, image resolution, interpolation, etc.),
+    feeding the real error back to Qwen for a whole-file fix each time.
+    _UnsafeComposeError (a safety-boundary violation, not a generation
+    bug) is the one exception -- it always propagates immediately, never
+    retried."""
+    for attempt in range(_MAX_COMPOSE_RECONCILE_ATTEMPTS + 1):
+        try:
+            _validate_compose(compose_path)
+        except _UnsafeComposeError:
+            raise
+        except ValueError as e:
+            error = str(e)
+        else:
+            result = subprocess.run(
+                ["docker", "compose", "-f", compose_path, "up", "-d"],
+                capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                return
+            error = f"docker compose up failed: {result.stderr.strip()}"
+
+        if attempt == _MAX_COMPOSE_RECONCILE_ATTEMPTS:
+            raise ValueError(error)
+
+        _log(f"compose failure (attempt {attempt + 1}/{_MAX_COMPOSE_RECONCILE_ATTEMPTS}): "
+             f"{error[:200]} -- asking Qwen to fix its own compose file")
+        with open(compose_path, encoding="utf-8") as f:
+            content = f.read()
+        fixed = _reconcile_compose(content, error)
+        if not fixed:
+            raise ValueError(error)
+        with open(compose_path, "w", encoding="utf-8") as f:
+            f.write(fixed)
 
 
 def _service_image(svc: dict) -> str:
@@ -303,8 +446,11 @@ def build_victim_topology(repo_path: str) -> dict:
             f"No docker-compose.yml and no recognized manifests found in {repo_path}"
         )
 
-    _log(f"found manifests: {list(manifest_map.keys())}, inferring compose via Qwen")
-    compose_content = _infer_compose_from_manifests(manifest_map)
+    docker_hints = _extract_docker_hints(repo_path)
+    _log(f"found manifests: {list(manifest_map.keys())}, "
+         f"inferring compose via Qwen"
+         + (" (with real README Docker hints)" if docker_hints else ""))
+    compose_content = _infer_compose_from_manifests(manifest_map, docker_hints)
     compose_path = os.path.join(repo_path, "docker-compose.argus.yml")
     with open(compose_path, "w", encoding="utf-8") as f:
         f.write(compose_content)

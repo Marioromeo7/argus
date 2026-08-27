@@ -43,6 +43,7 @@ logs/
 # Evaluation outputs (generated, not source)
 results/
 outputs/
+reports/
 .aider*
 
 # Context bundle (local only)

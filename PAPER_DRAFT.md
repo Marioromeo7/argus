@@ -2,12 +2,22 @@
 
 **Working draft — target: arXiv cs.CR, then IEEE S&P / USENIX Security.**
 
-> Status (2026-08-17): Architecture and Methods sections are drafted from the
-> implemented, tested system and are **not** results-gated. Results are
-> transcribed from the current evidence ledger ([PAPER_CLAIMS.md](PAPER_CLAIMS.md));
-> the expanded runs that firm up the small-sample claims (narrowing-engine
-> revalidation R1, grain-convergence and co-evolution sweeps R2) are pending and
-> are marked inline. Do not cite a number here that is not also in the ledger.
+> Status (2026-08-24): Architecture and Methods sections are drafted from the
+> implemented, tested system and are **not** results-gated. §5 was updated
+> 2026-08-24 with real R2 results, independently re-verified against the
+> actual committed data files rather than taken at face value from narrative
+> summary docs that in several cases overstated what those files actually
+> support — see [ROADMAP.md](ROADMAP.md)'s R2 section for the full
+> reconciliation. Net effect: retrieval precision (Claim 1) now has a real
+> 44-CVE result (a 2026-08-23 attempt at 12 CVEs was circular and is
+> excluded; the mechanism itself was broken — a mixed CVE/technique search
+> space — and was fixed before the real run); grain convergence (Claim 2)
+> now has a real 73-node population-scale result; co-evolution (Claim 3) now
+> has a real 100-cycle result that is still not significant (strengthening,
+> not weakening, the equilibrium reading). Narrowing-engine revalidation
+> (R1) is tracked separately in ROADMAP.md. `PAPER_CLAIMS.md` (the evidence
+> ledger this file is supposed to match) is synced to this section as of
+> the same date.
 
 ---
 
@@ -187,23 +197,34 @@ not merely install.
 We compare ARGUS GraphRAG against a flat vector RAG baseline on identical
 attack-path queries. Ground truth is derived independently from the NVD API
 (CWE mapping, reference URLs, keywords), never from the graph itself, to avoid
-circularity. Metrics: mean precision@10 and mean false-positive rate.
+circularity. Metrics: mean precision@10 and mean false-positive rate. The
+vector baseline's search space is restricted to technique/tactic-type nodes
+(the only node types ground truth can ever name), matching what GraphRAG's
+own graph traversal is structurally restricted to — the search space is not
+the whole graph for either method. We additionally report a two-stage
+retrieve-then-rerank variant of the vector baseline (embedding retrieval
+over a wider candidate pool, reranked by Qwen3 in fast mode) to test against
+a stronger baseline than flat nearest-neighbor search alone.
 
 ### 4.2 Grain convergence (Claim 2)
 
-We run the challenger over a set of nodes for N rounds and track the distribution
-of `grain_confidence` across rounds — mean and variance — testing whether the
-distribution shifts right monotonically and concentrates as nodes specialize.
-*Expanded-sample run pending (R2): current sample is small (Section 5).*
+We run the narrowing engine (Section 3.3) over a set of nodes to convergence
+(patience-bounded) and track the distribution of `grain_confidence` before vs.
+after — mean, variance, and the full histogram — testing whether the
+distribution shifts right at the population level. The original small pilot
+(4 hand-picked nodes, legacy self-graded challenger) has since been superseded
+by a full sweep of the narrowing engine over all 73 CVE/technique nodes with a
+technique edge in the graph (Section 5.2).
 
 ### 4.3 Co-evolution (Claim 3)
 
 We run repeated full red/blue engagement cycles and measure attack-path discovery
 rate (red) and mitigation effectiveness (blue) over cycles, with reflexion memory
 active. We report both the trend and the oscillation, and test for a monotonic
-slope. *We pre-registered that reaching statistical significance may require
-substantially more cycles; if it does not land, the honest characterization is
-equilibrium, not improvement (Section 5.3).*
+slope via linear regression (slope, R², two-tailed p) computed over the
+complete cycle sequence, not a subset of it. The original 50-cycle run has
+since been extended to 100 cycles (Section 5.3); we re-ran the same test on
+the full, current series rather than reusing an earlier partial result.
 
 ### 4.4 Hardware feasibility (Claim 4)
 
@@ -230,34 +251,105 @@ is not a nicety but the only reliable arbiter.
 
 ## 5. Results
 
-*Transcribed from the evidence ledger; conservative by design. Expanded runs
-(R1/R2) are pending and will replace the "small sample" caveats where they land.*
+*Conservative by design; §5.1, §5.2, and §5.3 were updated 2026-08-24 with
+real R2.1/R2.2/R2.3 results (independently re-verified against raw data —
+see the top-of-file status note), and `PAPER_CLAIMS.md` (the evidence ledger
+this section is transcribed from) is synced to match. The R1 narrowing-engine
+revalidation is still pending expansion.*
 
-### 5.1 Retrieval precision — Demonstrated (small sample)
+### 5.1 Retrieval precision — Demonstrated (44 CVEs)
 
-GraphRAG retrieved more relevant nodes than flat vector RAG on the same queries
-(mean P@10 0.083 vs 0.000; mean FPR 0.917 vs 1.000; Δ = +0.083), evaluated on
-6/10 CVEs with structured NVD ground truth (4 were pre-CWE-era). The claim is
-*relative* superiority on this task; absolute precision is low and the sample is
-small.
+The original pilot (6/10 CVEs with structured NVD ground truth, 4 pre-CWE-era)
+showed GraphRAG beating flat vector RAG (mean P@10 0.083 vs 0.000; mean FPR
+0.917 vs 1.000); it remains valid but is a small sample.
 
-### 5.2 Grain convergence — Demonstrated (small sample)
+A 2026-08-23 attempt to scale this to 12 CVEs (reported elsewhere as
+"27.04% vs 0%, a +138% improvement") is excluded from the record: it worked
+by writing the evaluation's own ground-truth CVE→technique pairs into the
+graph as edges and then measuring GraphRAG precision by retrieving those same
+edges back out — ground truth was not independent of the graph, so the
+result is circular by construction.
 
-Over 4 nodes × 3 challenger rounds, mean `grain_confidence` rose 0.30 → 0.90
-(Δ +0.60), monotonically non-decreasing, with variance shrinking as nodes
-specialized (std 0.000 → 0.217 → 0.043 → 0.035). *Larger-sample run pending
-(R2), and pending the narrowing-engine revalidation (R1) that makes the
-asker/answerer engine the default.*
+This has since been superseded by a real, methodologically sound run at the
+≥50-CVE scale the claim actually needs. Two mechanism bugs were fixed before
+scaling, not just the sample size: an unindexed `LIMIT 500` was silently
+excluding up to 285 of 785 real graph nodes from the retrieval baseline in
+arbitrary order, and — the load-bearing fix, found via a live rank-position
+audit — a mixed CVE-and-technique search space let same-genre text dominate
+nearest-neighbor retrieval regardless of topical relevance: the correct
+ground-truth technique ranked #545 of 783 candidates for one CVE and #184 of
+783 for another, far outside any retrievable window. This is a recall
+failure, not a ranking failure — confirmed by adding a two-stage
+retrieve-then-rerank baseline (Qwen3 reranking a 30-candidate embedding
+pool) that made no difference until the search was restricted to
+technique/tactic-type nodes only, mirroring what GraphRAG's own graph
+traversal already restricts to structurally.
 
-### 5.3 Co-evolution — Partial (equilibrium)
+On 44/52 evaluable CVEs (8 dropped for no NVD-derivable ground truth, the
+same honest exclusion criterion as the original pilot): GraphRAG mean P@10 =
+**0.176** (FPR 0.824); flat VectorRAG mean P@10 = **0.039** (FPR 0.961);
+reranked VectorRAG mean P@10 = **0.057** (FPR 0.943). GraphRAG outperforms
+both VectorRAG variants (Δ = +0.137 vs. flat, +0.119 vs. reranked); reranking
+measurably helps the vector baseline but does not close the gap. This is now
+the primary evidence for Claim 1. Still open: P@k for k∈{5,10,20} in one
+pass, MRR, nDCG@10, and bootstrapped 95% CIs on the delta — these need
+ranked, not set, retrieval results, a real design change beyond this run's
+scope (Section 7).
 
-Over 50 engagement cycles the agents converged to high mutual effectiveness
-(attack μ = 0.82, mitigation μ = 0.91) rather than a monotonic upward trend;
-**p < 0.05 was not met.** Attack confidence oscillates (σ = 0.18) as reflexion
-memory recognizes mitigated chains and lowers confidence to probe new strategies;
-mitigation stays stable (σ = 0.07). We present this as *mutual optimization under
-adversarial pressure* (equilibrium), which we argue is the correct
-characterization, not a failed improvement trend.
+### 5.2 Grain convergence — Demonstrated (population scale)
+
+The original pilot (4 hand-picked nodes, 3 rounds of the legacy self-graded
+challenger) showed mean `grain_confidence` rising 0.30 → 0.90 monotonically,
+with variance shrinking as nodes specialized (std 0.000 → 0.217 → 0.043 →
+0.035). This result stands but is a small, favorable sample from an engine
+since superseded (Section 3.3).
+
+It has since been superseded by a population-scale run of the narrowing
+engine over **all 73 CVE/technique nodes with a technique edge in the
+graph** — the full scope the claim requires, not a subsample. Mean
+`grain_confidence` rose **0.300 → 0.354** (seed → converged, +18.0%), std
+widening 0.000 → 0.291 as nodes specialized into a spread rather than a
+uniform shift: after-convergence, 28/73 nodes sit at 0.0–0.2, 22 at 0.2–0.4,
+2 at 0.4–0.6, 13 at 0.6–0.8, and 8 at 0.8–1.0; by stop reason, 23 nodes
+reached `resolved`, 40 `stalled`, 9 `partial`, 1 `skipped`. The population
+mean shifts right, but convergence is **not uniformly monotonic at the node
+level**: 37/73 nodes (50.7%) ended below their 0.3 seed. This is consistent
+with the mechanism itself (Section 3.3): the freshness term in the
+confidence formula can pull an individual node's score down on a round
+where the asker outpaces the answerer, even while that node's cumulative
+trust stays healthy. We report the population-level rightward shift as the
+evidence for Claim 2 and the node-level non-monotonicity as an honest
+qualifier — the claim concerns the distribution, not every individual node.
+
+### 5.3 Co-evolution — Partial (equilibrium, now on 100 cycles)
+
+Over the original 50 engagement cycles the agents converged to high mutual
+effectiveness (attack μ = 0.82, mitigation μ = 0.91) rather than a monotonic
+upward trend; p < 0.05 was not met. Attack confidence oscillated (σ = 0.18)
+as reflexion memory recognized mitigated chains and lowered confidence to
+probe new strategies; mitigation stayed stable (σ = 0.07).
+
+The run has since been extended to a full 100 cycles. Re-running the same
+regression method directly against the complete, current data: attack
+confidence mean 0.832 (σ = 0.147), slope +0.00063/cycle, R² = 0.015,
+**p = 0.221**; mitigation effectiveness mean 0.884 (σ = 0.068), slope
++0.00036/cycle, R² = 0.023, **p = 0.134**. Neither reaches significance. (A
+narrative summary produced during the run itself reported the attack trend
+as significant at p = 0.0395 under a "90/100 cycles, infrastructure
+ceiling" framing; that does not reproduce against the actual completed
+100-cycle data or the project's own regression code — the closest
+reconstruction is an undisclosed one-tailed test on a 90-cycle subset of
+what had, by completion, become a 100-cycle series. We report the direct
+recomputation against the complete data instead.) Doubling the sample from
+50 to 100 cycles did not produce significance — if anything this
+strengthens the equilibrium reading rather than weakening it: both slopes
+remain small and positive, oscillation persists, and more data did not
+resolve it into a trend. We continue to present this as mutual optimization
+under adversarial pressure, not a failed improvement trend — now backed by
+twice the cycles. The ≥150-cycle target and the stationarity /
+change-point / cross-correlation battery originally planned to test the
+equilibrium hypothesis directly, rather than only via a linear-trend
+p-value, remain open work (Section 7).
 
 ### 5.4 Hardware feasibility — Demonstrated
 
@@ -267,7 +359,23 @@ batch research use, not interactive product use.
 
 ## 6. Limitations
 
-- Small evaluation samples across all claims (the R1/R2 runs address this).
+- All three claims now have real, larger samples (44 CVEs; 73 nodes; 100
+  cycles), but retrieval precision (Claim 1) is still P@10 only — not the
+  full P@k/MRR/nDCG@10/bootstrapped-CI battery this claim's evaluation plan
+  specifies (Section 7); co-evolution (Claim 3) still does not reach
+  significance; and grain convergence (Claim 2)'s node-level convergence is
+  not uniformly monotonic (Section 5.2). A 2026-08-23 attempt to scale Claim
+  1 to 12 CVEs used a circular methodology (ground truth written into the
+  graph, then retrieved from it) and is excluded from all of the above.
+- Evaluation reporting has a demonstrated failure mode of its own, worth
+  naming rather than hiding: a 2026-08-23/24 batch of narrative result
+  summaries overstated what the underlying checkpoint/log files actually
+  supported — an incomplete 14/50-node checkpoint reported as a headline
+  number when a complete 73/73-node checkpoint already existed and showed a
+  different figure, and a co-evolution significance claim that does not
+  reproduce against the actual completed data using the project's own
+  regression code. Section 5 above reflects direct recomputation against the
+  raw result files, not the summaries.
 - Local model latency limits interactive use.
 - Neo4j properties/logs are currently stored as stringified dicts, limiting
   production-grade querying/analytics.
@@ -280,10 +388,17 @@ batch research use, not interactive product use.
 ## 7. Conclusion and Future Work
 
 ARGUS demonstrates that making uncertainty and provenance first-class in a
-security knowledge graph, and refining them through adversarial interrogation and
-execution grounding, is feasible on consumer hardware and yields measurable —
-if currently small-sample — improvements in retrieval and node specificity, plus
-an interpretable co-evolutionary equilibrium between red and blue agents. Future
-work: the expanded grain-convergence and co-evolution runs, the NLI-based
-groundedness upgrade, and broader execution-grounded technique validation via
-the cyber range.
+security knowledge graph, and refining them through adversarial interrogation
+and execution grounding, is feasible on consumer hardware and yields
+measurable improvements in retrieval precision over a flat vector baseline at
+real scale (Section 5.1), in node specificity at population scale (Section
+5.2), and an interpretable co-evolutionary equilibrium between red and blue
+agents that persists under a doubled sample (Section 5.3). Future work: the
+full P@k/MRR/nDCG@10/bootstrapped-CI battery for retrieval precision beyond
+the P@10 result already in hand (a 2026-08-23 attempt to reach this via a
+circular methodology was invalidated by ground-truth leakage and is not
+load-bearing here); a ≥150-cycle co-evolution run with the
+stationarity / change-point / cross-correlation battery needed to test the
+equilibrium hypothesis directly rather than via a linear-trend p-value alone;
+the NLI-based groundedness upgrade; and broader execution-grounded technique
+validation via the cyber range.

@@ -9,6 +9,8 @@ import threading
 import time
 from datetime import datetime
 
+import requests
+
 from graphrange.scenario_generator import get_valid_scenarios, mark_scenario_complete
 from graphrange.graph_updater import (
     write_scenario_run, write_outcome, update_technique_confidence,
@@ -55,15 +57,17 @@ def run_one(scenario: dict, driver) -> dict:
     """
     ARGUS-LAYER-7: Run a single scenario end to end:
     1. Write ScenarioRun node (status=running)
-    2. Start blue monitor thread
-    3. Red: plan_attack() -> execute_attack()
-    4. Stop blue monitor thread
-    5. Assess detection
-    6. Write Outcome node
-    7. Update technique confidence
-    8. Check for conflicts
-    9. Update ScenarioRun status to completed/failed/stalemate
-    10. Return summary dict
+    2. Spawn red/blue/victim containers via the supervisor
+    3. Start blue monitor thread
+    4. Red: plan_attack() -> execute_attack()
+    5. Stop blue monitor thread
+    6. Assess detection
+    7. Write Outcome node
+    8. Update technique confidence
+    9. Check for conflicts
+    10. Update ScenarioRun status to completed/failed/stalemate
+    11. Teardown containers
+    12. Return summary dict
 
     D5 (2026-08-17): plan_attack() is now handed the target `scenario` so it
     plans FOR it (seeds the scenario's CVE first) instead of independently
@@ -71,12 +75,58 @@ def run_one(scenario: dict, driver) -> dict:
     plan against the scenario (_check_plan_matches_scenario) and record whether
     "what red planned" actually matched "what got measured" -- a divergence is
     logged and surfaced as scenario_match in the returned dict, not silently
-    ignored. NOT yet live-validated: the targeting + cross-check were added
-    file-only; needs the Phase 7 GPU run to confirm end to end.
+    ignored.
+
+    Spawn/teardown added 2026-08-24, found missing via a real live P2.1 run:
+    execute_attack() assumes containers named gr-red-{run_suffix}/
+    gr-victim-{run_suffix} already exist, but nothing in this function ever
+    called spawn_scenario() to create them -- every run failed with
+    execution.status=supervisor_error (a real requests.RequestException from
+    /exec targeting a nonexistent container), confirmed against
+    results/p2_1_live_run.log before this fix. scenario["run_id"] is set
+    ONCE, before spawning, and reused by both spawn_scenario() (whose own
+    run_suffix defaults to "adhoc" if scenario has no run_id) and
+    execute_attack() (whose run_suffix falls back to the engagement_id if
+    scenario has none) -- setting it here is what keeps both sides naming
+    the same containers.
     """
     run_id = f"RUN-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+    scenario = {**scenario, "run_id": run_id}
     t0 = time.time()
     write_scenario_run(driver, scenario, run_id)
+
+    try:
+        # 600s, not 180s -- found live 2026-08-24: a real MySQL-from-source
+        # spawn (install+start) took ~4 min end to end, and a 180s client
+        # timeout fired while the server was still working (confirmed via
+        # the supervisor's own access log showing a 200 several minutes
+        # later) -- the client gives up but the containers still get
+        # created, orphaning them since /teardown is never reached.
+        spawn_resp = requests.post(f"{SUPERVISOR_URL}/spawn_scenario", json=scenario,
+                                    timeout=600)
+        spawn_resp.raise_for_status()
+        spawn_result = spawn_resp.json()
+    except requests.RequestException as e:
+        print(f"  [run_scenario] spawn_scenario failed: {e}")
+        spawn_result = {}
+
+    red_id = spawn_result.get("red_id")
+    blue_id = spawn_result.get("blue_id")
+    victim_id = spawn_result.get("victim_id")
+
+    if not (red_id and blue_id and victim_id):
+        # Never got containers -- an infrastructure failure, not a scenario
+        # outcome. Mirrors exec_result.get("status") != "executed" below,
+        # which already treats this class of failure as neither side "winning."
+        update_scenario_run_status(driver, run_id, "failed", "", turn_count=0,
+                                    duration_seconds=int(time.time() - t0))
+        mark_scenario_complete(driver, scenario, run_id)
+        return {
+            "run_id": run_id, "outcome_id": None, "status": "failed", "winner": "",
+            "execution": {"status": "spawn_failed", "spawn_result": spawn_result},
+            "detection": {"detected": False, "detection_type": "", "turn_detected": -1},
+            "scenario_match": {"matched": None},
+        }
 
     monitor_result = {}
     stop_event = threading.Event()
@@ -87,13 +137,27 @@ def run_one(scenario: dict, driver) -> dict:
     monitor_thread = threading.Thread(target=_run_monitor)
     monitor_thread.start()
 
-    plan_result = plan_attack(driver, scenario=scenario)
-    engagement = plan_result.get("engagement") or {
-        "engagement_id": run_id, "selected_chain": [], "confidence": 0.0,
-        "reasoning": "no attack surface available", "preconditions": [],
-    }
+    try:
+        plan_result = plan_attack(driver, scenario=scenario)
+        engagement = plan_result.get("engagement") or {
+            "engagement_id": run_id, "selected_chain": [], "confidence": 0.0,
+            "reasoning": "no attack surface available", "preconditions": [],
+        }
 
-    exec_result = execute_attack(driver, SUPERVISOR_URL, scenario, engagement)
+        exec_result = execute_attack(driver, SUPERVISOR_URL, scenario, engagement)
+    finally:
+        # Stop the monitor thread BEFORE tearing down containers -- it polls
+        # blue/victim via /exec on its own timer (agents/blue.py monitor()),
+        # so tearing down first would have it querying containers that no
+        # longer exist.
+        stop_event.set()
+        monitor_thread.join(timeout=MONITOR_JOIN_TIMEOUT)
+        try:
+            requests.post(f"{SUPERVISOR_URL}/teardown",
+                           json={"red_id": red_id, "blue_id": blue_id, "victim_id": victim_id},
+                           timeout=60)
+        except requests.RequestException as e:
+            print(f"  [run_scenario] teardown failed: {e}")
 
     # D5 cross-check: confirm red actually planned for this scenario (targeting
     # can still miss if the LLM picks a different seeded chain). Recorded, not
@@ -104,8 +168,6 @@ def run_one(scenario: dict, driver) -> dict:
               f"scenario -- planned techniques {scenario_match['planned_techniques']} "
               f"vs target {scenario_match['target_technique']!r}")
 
-    stop_event.set()
-    monitor_thread.join(timeout=MONITOR_JOIN_TIMEOUT)
     detection_events = monitor_result.get("events", [])
     detection = assess_detection(detection_events, scenario)
 

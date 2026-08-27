@@ -1,12 +1,13 @@
 """
 ARGUS-SCANNER: Pass 1 -- scans every file in the repo for suspicious
-patterns. All files: source, tests, configs, dependencies. Skips only
-binary files.
+patterns. Source, configs, dependencies -- not documentation or test
+directories (see SKIP_EXTENSIONS/SKIP_DIRS below) and not binary files.
 """
 
 import os
 import re
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -18,15 +19,45 @@ from config import OLLAMA_CHAT_URL as OLLAMA_URL
 QWEN_MODEL = "qwen3:8b"
 
 SKIP_EXTENSIONS = {'.class', '.jar', '.war', '.png', '.jpg', '.gif',
-                   '.ico', '.woff', '.ttf', '.eot', '.svg', '.zip'}
+                   '.ico', '.woff', '.ttf', '.eot', '.svg', '.zip',
+                   # Documentation formats, added 2026-08-25 -- found live
+                   # scanning WebGoat: 274 of its 1355 real work units were
+                   # .adoc lesson write-ups (prose describing a vuln, not
+                   # code that could contain one), each still costing a
+                   # full Qwen call for a guaranteed empty result. General,
+                   # not WebGoat-specific: no ecosystem's real
+                   # vulnerabilities live in prose documentation.
+                   '.adoc', '.md', '.rst'}
+
+# Directory names skipped anywhere in the tree, added 2026-08-25 for the
+# same reason as SKIP_EXTENSIONS -- found live scanning WebGoat: its
+# src/it/ integration-test tree (playwright page objects, test fixtures)
+# and *.txt sample files added real Qwen-call cost for code that isn't the
+# shipped product surface. This is a real, common SAST convention (most
+# scanners default to skipping test trees), not a WebGoat-specific
+# workaround -- these directory names are near-universal across ecosystems.
+SKIP_DIRS = {'.git', 'test', 'tests', '__tests__', 'spec', 'specs',
+             'it', 'integration-test', 'integration-tests'}
 MAX_FILE_TOKENS = 6000   # Qwen3 8B safe context per call
 CHUNK_OVERLAP = 200      # token overlap between chunks
-MAX_WORKERS = 3          # bounded parallelism -- safe for local Qwen3 8B
-CALL_TIMEOUT = 600       # seconds per Qwen call before skipping the file -- 90s
+# 2, found via a real live sweep 2026-08-24 against a Colab T4 -- the
+# initial theory (remote Ollama was OLLAMA_NUM_PARALLEL=1, so raise it and
+# MAX_WORKERS together) was only half right: after fixing that, N=1/2/4
+# concurrent real calls measured 13.1s/8.6s/8.5s effective-per-file --
+# throughput improves 1->2, then genuinely flatlines 2->4. The T4's compute
+# is saturated at ~2 concurrent qwen3:8b streams; more client-side workers
+# beyond that buys nothing (a compute-bound ceiling, not a queuing one).
+# Revisit if the tunnel ever points at a bigger GPU (L4/A100/H100).
+MAX_WORKERS = 2
+CALL_TIMEOUT = 1800      # seconds per Qwen call before skipping the file -- 90s
                          # was silently skipping files (no error, just fewer
                          # findings) given this hardware's observed real
                          # latency (minutes, not seconds, even in /no_think
-                         # mode with small prompts)
+                         # mode with small prompts); bumped again from 600s
+                         # 2026-08-25 after a comparable-scale local call
+                         # (victim_builder's compose inference) exceeded
+                         # 600s outright on the only compute left (local
+                         # RTX 3050) once Colab's quota ran out
 
 
 def _log(msg: str) -> None:
@@ -99,13 +130,64 @@ def _chunk_content(content: str) -> list:
     return [(c, i, total) for i, c in enumerate(chunks)]
 
 
+_CHECKPOINT_SAVE_EVERY = 10  # work units between checkpoint writes
+
+
+def _checkpoint_path(repo_path: str) -> str:
+    return os.path.join(repo_path, ".argus_scan_checkpoint.json")
+
+
+def _work_unit_key(filepath: str, idx: int, total: int) -> str:
+    return f"{filepath}::{idx}/{total}"
+
+
+def _load_checkpoint(repo_path: str) -> dict:
+    """ARGUS-SCANNER: {work_unit_key: [flags]} for already-completed units,
+    {} if no checkpoint exists or it's unreadable. Found live 2026-08-25:
+    a real multi-hour WebGoat scan completed its ENTIRE 1355-work-unit pass
+    and then lost all of it to an unhandled connection error in the final
+    merge step (results only lived in an in-memory list, never persisted) --
+    this and _save_checkpoint make scan_repo() resumable against the exact
+    same repo_path instead of re-paying for every already-done call."""
+    path = _checkpoint_path(repo_path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_checkpoint(repo_path: str, checkpoint: dict) -> None:
+    """ARGUS-SCANNER: Atomic write (temp file + os.replace) so a crash
+    mid-write never corrupts the checkpoint -- os.replace is atomic on both
+    POSIX and Windows, a plain open(path, "w") is not."""
+    path = _checkpoint_path(repo_path)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(checkpoint, f)
+    os.replace(tmp, path)
+
+
 def scan_repo(repo_path: str) -> list:
     """
     ARGUS-SCANNER: Walks the entire staged repo (already validated by
-    repo_intake). Returns a merged flag list.
+    repo_intake). Returns a merged flag list. Resumable: checkpoints
+    completed work units to .argus_scan_checkpoint.json inside repo_path
+    every _CHECKPOINT_SAVE_EVERY completions (thread-safe) and a final save
+    before merging -- a second call with the SAME repo_path (e.g. after a
+    crash) skips every already-checkpointed unit rather than re-scanning.
     """
     work_units = []
-    for root, _, files in os.walk(repo_path):
+    for root, dirs, files in os.walk(repo_path):
+        # .git internals aren't source content -- sending them to Qwen just
+        # burns real GPU time for a guaranteed "unparseable response,
+        # skipping" (found live 2026-08-24 scanning WebGoat's own real
+        # .git directory). Test/spec/integration-test directories excluded
+        # 2026-08-25 for the same cost reason -- see SKIP_DIRS's own
+        # comment above.
+        dirs[:] = [d for d in dirs if d.lower() not in SKIP_DIRS]
         for name in files:
             if name in (".argus_skip",) or name.startswith(".argus"):
                 continue
@@ -119,24 +201,43 @@ def scan_repo(repo_path: str) -> list:
             for chunk_text, idx, total in _chunk_content(wrapped):
                 work_units.append((filepath, chunk_text, idx, total))
 
-    _log(f"{len(work_units)} work units across the repo")
+    checkpoint = _load_checkpoint(repo_path)
+    pending = [
+        (filepath, chunk_text, idx, total)
+        for filepath, chunk_text, idx, total in work_units
+        if _work_unit_key(filepath, idx, total) not in checkpoint
+    ]
+    already_done = len(work_units) - len(pending)
+    _log(f"{len(work_units)} work units across the repo"
+         + (f" ({already_done} already checkpointed, resuming)" if already_done else ""))
+
     results = []
+    for flags in checkpoint.values():
+        results.extend(flags)
+
     completed = 0
+    checkpoint_lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(_scan_file, filepath, chunk_text, idx, total): filepath
-            for filepath, chunk_text, idx, total in work_units
+            executor.submit(_scan_file, filepath, chunk_text, idx, total): (filepath, idx, total)
+            for filepath, chunk_text, idx, total in pending
         }
         for future in as_completed(futures):
-            filepath = futures[future]
+            filepath, idx, total = futures[future]
             try:
-                results.extend(future.result(timeout=CALL_TIMEOUT))
+                flags = future.result(timeout=CALL_TIMEOUT)
             except Exception as e:
                 _log(f"skipping {filepath}: {e}")
-            completed += 1
-            if completed % 10 == 0:
-                _log(f"{completed}/{len(work_units)} complete")
+                flags = []
+            results.extend(flags)
+            with checkpoint_lock:
+                checkpoint[_work_unit_key(filepath, idx, total)] = flags
+                completed += 1
+                if completed % _CHECKPOINT_SAVE_EVERY == 0:
+                    _save_checkpoint(repo_path, checkpoint)
+                    _log(f"{completed}/{len(pending)} pending complete (checkpoint saved)")
 
+    _save_checkpoint(repo_path, checkpoint)
     return merge_chunks(results)
 
 
@@ -195,7 +296,14 @@ def merge_chunks(flags: list) -> list:
 
 
 def _merge_call(chunk_flags: list) -> dict:
-    """ARGUS-SCANNER: Qwen3 merges partial findings from a chunked file."""
+    """ARGUS-SCANNER: Qwen3 merges partial findings from a chunked file.
+    Degrades to the first chunk's own flag on ANY failure (bad JSON OR a
+    real request/connection error), not just a parse failure -- found live
+    2026-08-25: an uncaught requests.ConnectionError here (the Ollama
+    tunnel died between the scan pass finishing and this running) crashed
+    the entire scan_repo() call, losing a completed 1355-work-unit pass
+    that was never persisted. A degraded (unmerged) finding is still a
+    real, useful finding; a crash here has no upside over falling back."""
     prompt = (
         "These are partial findings from different chunks of the same "
         f"file/method. Merge into a single coherent finding: "
@@ -207,7 +315,11 @@ def _merge_call(chunk_flags: list) -> dict:
         "If chunks describe different vulnerabilities, return the most severe.\n"
         "Return ONLY the JSON object."
     )
-    raw = _call_qwen(prompt, "scanner.file_scanner._merge_call")
+    try:
+        raw = _call_qwen(prompt, "scanner.file_scanner._merge_call")
+    except requests.RequestException as e:
+        _log(f"merge call failed ({e}), falling back to unmerged first chunk")
+        return chunk_flags[0]
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
     try:
         return json.loads(raw)

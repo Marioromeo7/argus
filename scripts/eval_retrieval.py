@@ -21,7 +21,7 @@ Usage:
     python scripts/eval_retrieval.py
 """
 
-import sys, os, re, time, json, argparse
+import sys, os, re, time, json, argparse, ast
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Defensive: this Windows environment's stdout defaults to cp1252 when
@@ -46,11 +46,21 @@ import chromadb
 # 2026-08-19 hitting exactly this crash trying to verify the R2.1 changes.
 import config  # noqa: F401
 import ollama
+import requests
 import numpy as np
 from dotenv import load_dotenv
 load_dotenv()
 
 from graph.ingestion.nvd import fetch_cves
+
+# R2.1 fix (2026-08-24): NVD's anonymous rate limit is 5 requests/30s
+# (~6s/request minimum) -- the previous 0.6s sleep was ~10x too fast and
+# reliably hit 429s live (5/10 CVEs failed ground-truth lookup this way in
+# the first corrected run). 0.6s was only ever safe WITH an API key (limit
+# 50/30s, ~0.6s/request) -- but no NVD_API_KEY was actually set. Now paced
+# dynamically off whether one is present, matching the real limit either way.
+NVD_API_KEY = os.getenv("NVD_API_KEY", "")
+NVD_SLEEP_INTERVAL = 0.65 if NVD_API_KEY else 6.5
 
 
 # ── ATT&CK technique mapping tables (independent of the graph) ───────────────
@@ -116,7 +126,7 @@ def _nvd_technique_candidates(cve_id: str) -> set[str]:
     """
     try:
         rows = fetch_cves(cve_id=cve_id, limit=1)
-        time.sleep(0.6)          # stay within NVD rate limit
+        time.sleep(NVD_SLEEP_INTERVAL)          # stay within NVD rate limit
     except Exception as e:
         print(f"    [WARN] NVD fetch failed for {cve_id}: {e}")
         return set()
@@ -158,31 +168,90 @@ def _nvd_technique_candidates(cve_id: str) -> set[str]:
     return candidates
 
 
-def _nvd_ground_truth(driver, cve_id: str) -> set[str]:
+def _nvd_ground_truth(driver, cve_id: str, candidates: set[str] = None) -> set[str]:
     """
     Ground truth: base T-IDs derived from NVD data only (CWE mapping,
     reference URLs, description keywords), filtered to nodes that exist
     in the graph. No sub-technique expansion — keeps ground truth
     independent of graph structure so neither retrieval method is favoured.
+
+    R2.1 fix (2026-08-24): accepts pre-fetched `candidates` so callers that
+    also want the raw candidate set (e.g. for logging) don't make a second,
+    fully redundant NVD API call for the same CVE -- the eval loop below
+    was doing exactly that, silently doubling every CVE's NVD call count
+    and halving effective throughput against the rate limit.
     """
     from graph.retrieval import get_node
-    candidates = _nvd_technique_candidates(cve_id)
+    if candidates is None:
+        candidates = _nvd_technique_candidates(cve_id)
     return {tid for tid in candidates if get_node(driver, tid)}
 
 
 # ── Embedding & ChromaDB baseline ────────────────────────────────────────────
 
+# R2.1 fix (2026-08-24): nomic-embed-text's real context is 2048 tokens (per
+# a live /api/show against the model actually in use -- the 8192 `num_ctx`
+# shown alongside it is a request-time default that does NOT override the
+# model's own trained limit, `model_info["nomic-bert.context_length"]`).
+# Verified empirically: the single longest description anywhere in the graph
+# (T1553.003, 4680 chars) embedded cleanly in one call with room to spare
+# (~1000-1100 tokens of ~2048 budget). 6000 chars is a generous ceiling well
+# above every real description seen (technique descriptions run up to 4680
+# chars, median 1298; CVE descriptions are typically much shorter) -- a
+# safety net, not a chunking requirement. No chunk/pool pipeline needed.
+_EMBED_TEXT_MAX_CHARS = 6000
+
+
+def _node_embed_text(node: dict) -> str:
+    """
+    Text used to embed a node -- the actual description, not the whole
+    stringified properties dict. R2.1 fix (2026-08-24): the old
+    `label + node_type + str(properties)` construction, truncated to 512
+    chars, spent most of that budget on structural boilerplate before
+    reaching any real prose -- for technique nodes specifically, properties
+    are ordered `name, tactics, is_subtechnique, platforms, description`, so
+    ~150-200 chars of tactics/platforms lists were consumed before
+    `description` (which can run up to 4680 chars) even started. Embedding
+    `description` directly, with a generous ceiling instead of a tight one,
+    gives VectorRAG a fair baseline instead of a handicapped one.
+    """
+    nid       = node.get("node_id", "")
+    label     = node.get("label", nid)
+    node_type = node.get("node_type", "")
+    props_raw = node.get("properties", "")
+    try:
+        props = ast.literal_eval(props_raw) if isinstance(props_raw, str) else (props_raw or {})
+    except (ValueError, SyntaxError):
+        props = {}
+    description = props.get("description", "") or ""
+    text = f"{label} ({node_type}): {description}" if description else f"{label} {node_type}"
+    return text[:_EMBED_TEXT_MAX_CHARS]
+
+
 def _embed(text: str) -> list[float]:
     resp = ollama.embeddings(
         model="nomic-embed-text",
-        prompt=text[:512],
+        prompt=text,
         options={"num_gpu": 0},   # run on CPU so Qwen3 can stay loaded in VRAM
     )
     return resp["embedding"]
 
 
 def _build_chroma_index(driver) -> chromadb.Collection:
-    """Embed all vulnerability/technique/tactic nodes into ChromaDB."""
+    """
+    Embed all vulnerability/technique/tactic nodes into ChromaDB.
+
+    R2.1 fix (2026-08-24): the old `LIMIT 500` with no `ORDER BY` silently
+    excluded up to 285 of the 785 real candidate nodes (697 technique + 73
+    vulnerability + 15 tactic) in an arbitrary, non-reproducible order --
+    confirmed live against the actual graph that two of the recurring
+    ground-truth technique IDs the CWE/keyword tables produce (T1078,
+    T1068) and all 15 tactic nodes were excluded, which guarantees 0%
+    precision for any CVE whose only ground truth is one of them,
+    independent of embedding quality. Fixed by removing the cap (785 nodes
+    is cheap to embed in full -- nomic-embed-text runs CPU-only and doesn't
+    compete with Qwen3's GPU memory) and adding ORDER BY for reproducibility.
+    """
     client = chromadb.Client()
     try:
         client.delete_collection("argus_eval")
@@ -193,19 +262,18 @@ def _build_chroma_index(driver) -> chromadb.Collection:
     with driver.session() as session:
         rows = list(session.run(
             "MATCH (n:Node) WHERE n.node_type IN ['vulnerability','technique','tactic'] "
-            "RETURN n LIMIT 500"
+            "RETURN n ORDER BY n.node_id"
         ))
 
     ids, docs, metas, embeddings = [], [], [], []
     for r in rows:
         node = dict(r["n"])
         nid  = node.get("node_id", "")
-        text = (f"{node.get('label', nid)} {node.get('node_type', '')} "
-                f"{str(node.get('properties', ''))}")
+        text = _node_embed_text(node)
         ids.append(nid)
-        docs.append(text[:512])
+        docs.append(text)
         metas.append({"node_type": node.get("node_type", "unknown")})
-        embeddings.append(_embed(text[:512]))
+        embeddings.append(_embed(text))
 
     if ids:
         col.add(ids=ids, documents=docs, metadatas=metas, embeddings=embeddings)
@@ -226,19 +294,127 @@ def _graphrag_retrieve(driver, cve_id: str, k: int = 10) -> set[str]:
         return {r["nid"] for r in session.run(cypher, cve=cve_id, k=k)}
 
 
+# R2.1 fix (2026-08-24): found via a live rank-position audit, not assumed --
+# with all 785 nodes (73 vulnerability + 697 technique + 15 tactic) in one
+# undifferentiated searchable index, the correct ground-truth technique
+# ranked #545 of 783 for one CVE and #184 of 783 for another. The top of
+# BOTH rankings was solid vulnerability-type nodes only (30/30 in one case).
+# Root cause: CVE descriptions are far more textually similar to *other CVE
+# descriptions* (same terse "X vulnerability in Y allows Z" register) than to
+# ATT&CK's "Adversaries may..." prose, so same-type nodes dominate a flat
+# nearest-neighbor search regardless of actual topical relevance -- a
+# recall failure, not a ranking failure. No amount of widening a rerank
+# pool fixes a candidate that's still ~200-550 ranks outside it. Ground
+# truth can only ever be a technique/tactic node, so a CVE was never a
+# valid answer and never belonged in the search space -- fixed by filtering
+# the query itself to technique/tactic types, mirroring exactly what
+# GraphRAG's own Cypher already restricts to (`n.node_type IN
+# ['technique','tactic']`) so the two methods search the same candidate
+# space and the comparison is actually apples-to-apples.
+_TECHNIQUE_TYPE_FILTER = {"node_type": {"$in": ["technique", "tactic"]}}
+
+
 def _vector_retrieve(col, driver, cve_id: str, k: int = 10) -> set[str]:
-    """Baseline vector RAG: embed CVE description, return top-K from ChromaDB."""
+    """Baseline flat vector RAG: embed CVE description, return top-K technique/
+    tactic nodes from ChromaDB (CVE nodes excluded from the search space --
+    see _TECHNIQUE_TYPE_FILTER's comment)."""
     from graph.retrieval import get_node
     node = get_node(driver, cve_id)
     if not node:
         return set()
-    text = (f"{node.get('label', cve_id)} {node.get('node_type', '')} "
-            f"{str(node.get('properties', ''))}")
-    emb     = _embed(text[:512])
+    text    = _node_embed_text(node)
+    emb     = _embed(text)
     n_query = min(k, max(1, col.count() - 1))
-    results = col.query(query_embeddings=[emb], n_results=n_query)
+    results = col.query(query_embeddings=[emb], n_results=n_query,
+                         where=_TECHNIQUE_TYPE_FILTER)
     ids     = results["ids"][0] if results["ids"] else []
     return {i for i in ids if i != cve_id}
+
+
+# ── Retrieve-then-rerank (two-stage) ─────────────────────────────────────────
+# Flat embedding nearest-neighbor is genuinely weak at fine-grained relevance
+# among many superficially-similar candidates (measured directly 2026-08-24:
+# a real SQL-injection CVE's correct technique, T1190, scored a respectable
+# 0.588 cosine similarity yet still lost to a decoy at 0.611 — real signal,
+# just not always the top one). The standard fix is two-stage retrieve-then-
+# rerank: cast a wider net with the cheap embedding search, then have a more
+# capable model re-score just that shortlist. No dedicated reranker model is
+# in this project's stack (local-only, per CLAUDE.md) -- Qwen3 8B, already
+# wired up via config.py, plays that role instead in fast (non-think) mode.
+
+_RERANK_POOL_SIZE = 30  # first-stage width before reranking narrows to k
+
+
+def _rerank_with_qwen(query_text: str, candidates: list[dict], top_k: int) -> list[str] | None:
+    """
+    Qwen3 fast-mode rerank: given a CVE's text and a candidate pool of
+    (id, text) dicts from the first-stage embedding retrieval, ask the model
+    to pick and order the top_k most relevant by number, not id (shorter,
+    less to get wrong verbatim). Returns None on any failure (bad response,
+    parse failure, timeout) so the caller can fall back to the embedding
+    order instead of crashing a long eval run over one bad call.
+    """
+    numbered = "\n".join(
+        f"{i+1}. [{c['id']}] {c['text'][:280]}"
+        for i, c in enumerate(candidates)
+    )
+    prompt = (
+        "You are ranking MITRE ATT&CK technique/tactic candidates by how "
+        "relevant each one is to a specific security vulnerability (CVE).\n\n"
+        f"CVE:\n{query_text[:700]}\n\n"
+        f"Candidates:\n{numbered}\n\n"
+        f"Return ONLY a JSON array of the {top_k} candidate NUMBERS (the "
+        "leading integer, not the [ID]), ordered most to least relevant to "
+        "this CVE's actual vulnerability mechanism. Example: [4, 1, 12]. "
+        "No explanation, no other text."
+    )
+    try:
+        resp = requests.post(config.OLLAMA_CHAT_URL, json={
+            "model": "qwen3:8b",
+            "messages": [{"role": "user", "content": prompt}],
+            "think": False,   # HTTP "think" field, not a prompt prefix --
+            "stream": False,  # /no_think in the prompt body is a documented
+        }, timeout=90)        # no-op for Qwen3 8B (see CONTEXT.md).
+        resp.raise_for_status()
+        content = resp.json()["message"]["content"].strip()
+        content = re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.M).strip()
+        numbers = json.loads(content)
+        ids = []
+        for n in numbers:
+            idx = int(n) - 1
+            if 0 <= idx < len(candidates):
+                ids.append(candidates[idx]["id"])
+        return ids[:top_k] if ids else None
+    except Exception:
+        return None
+
+
+def _vector_retrieve_reranked(col, driver, cve_id: str, k: int = 10,
+                               pool_size: int = _RERANK_POOL_SIZE) -> set[str]:
+    """
+    Two-stage vector RAG: retrieve a wider embedding pool, rerank it with
+    Qwen3, return the reranked top-K. Falls back to plain embedding order
+    (i.e. degrades to _vector_retrieve's behavior) if the rerank call fails.
+    """
+    from graph.retrieval import get_node
+    node = get_node(driver, cve_id)
+    if not node:
+        return set()
+    text    = _node_embed_text(node)
+    emb     = _embed(text)
+    n_query = min(pool_size, max(1, col.count() - 1))
+    results = col.query(query_embeddings=[emb], n_results=n_query,
+                         where=_TECHNIQUE_TYPE_FILTER)
+    ids     = [i for i in (results["ids"][0] if results["ids"] else []) if i != cve_id]
+    docs    = results["documents"][0] if results["documents"] else []
+    doc_map = dict(zip(results["ids"][0], docs)) if results["ids"] else {}
+    if not ids:
+        return set()
+    candidates = [{"id": i, "text": doc_map.get(i, i)} for i in ids]
+    reranked = _rerank_with_qwen(text, candidates, k)
+    if reranked:
+        return set(reranked)
+    return set(ids[:k])  # fallback: embedding order, same as the flat baseline
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -259,7 +435,8 @@ def _metrics(retrieved: set, ground_truth: set) -> dict:
 
 # ── Main eval ─────────────────────────────────────────────────────────────────
 
-def run_eval(k: int = 10, n_cves: int = 10) -> dict:
+def run_eval(k: int = 10, n_cves: int = 10, rerank: bool = True,
+             rerank_pool: int = _RERANK_POOL_SIZE) -> dict:
     """
     ROADMAP R2.1 (2026-08-19): n_cves was hardcoded to 10 via a fixed `LIMIT 10`
     in the Cypher below -- made it a real parameter so a >=50-CVE run (the
@@ -297,15 +474,20 @@ def run_eval(k: int = 10, n_cves: int = 10) -> dict:
     total_nodes = col.count()
     print(f"  Indexed: {total_nodes} nodes")
 
-    print(f"\nDeriving NVD ground truth independently for {len(test_cves)} CVEs...")
+    print(f"\nDeriving NVD ground truth independently for {len(test_cves)} CVEs "
+          f"({'with' if NVD_API_KEY else 'without'} NVD_API_KEY, "
+          f"{NVD_SLEEP_INTERVAL}s/request)...")
     gt_map: dict[str, set] = {}
     for cve_id in test_cves:
-        gt = _nvd_ground_truth(driver, cve_id)
+        # R2.1 fix (2026-08-24): one NVD fetch per CVE, not two -- candidates
+        # is now passed into _nvd_ground_truth() instead of being re-fetched
+        # right after just for this log line, which was silently doubling
+        # every CVE's NVD call count (see _nvd_ground_truth's docstring).
+        candidates = _nvd_technique_candidates(cve_id)
+        gt = _nvd_ground_truth(driver, cve_id, candidates=candidates)
         gt_map[cve_id] = gt
-        sources = _nvd_technique_candidates(cve_id)
-        print(f"  {cve_id}: NVD candidates={sources or '{}'} -> "
+        print(f"  {cve_id}: NVD candidates={candidates or '{}'} -> "
               f"graph-intersected GT={gt or '{}'}")
-        time.sleep(0.4)
 
     # Drop CVEs where NVD produced no ground truth
     # (old CVEs with no CWE/refs/keyword matches — can't evaluate fairly)
@@ -318,26 +500,38 @@ def run_eval(k: int = 10, n_cves: int = 10) -> dict:
         _report_no_gt(driver, col, test_cves, k)
         return {}
 
-    graphrag_scores, vector_scores = [], []
-    retrieved_map: dict[str, dict] = {}  # cve_id -> {"graphrag": set, "vector": set}
-    header = (f"\n{'CVE':<22} {'GT':>4} {'Method':<12} "
+    graphrag_scores, vector_scores, rerank_scores = [], [], []
+    retrieved_map: dict[str, dict] = {}
+    methods = ["GraphRAG", "VectorRAG"] + (["VectorRAG+Rerank"] if rerank else [])
+    header = (f"\n{'CVE':<22} {'GT':>4} {'Method':<18} "
               f"{'P@K':>6} {'Recall':>8} {'FPR':>7} {'TP/FP/FN'}")
     print(header)
-    print("-" * 75)
+    print("-" * 80)
 
-    for cve_id, gt in evaluable.items():
+    for i, (cve_id, gt) in enumerate(evaluable.items(), 1):
         g_ret = _graphrag_retrieve(driver, cve_id, k=k)
         v_ret = _vector_retrieve(col, driver, cve_id, k=k)
-        retrieved_map[cve_id] = {"graphrag": g_ret, "vector": v_ret}
+        entry = {"graphrag": g_ret, "vector": v_ret}
         g_m   = _metrics(g_ret, gt)
         v_m   = _metrics(v_ret, gt)
         graphrag_scores.append(g_m)
         vector_scores.append(v_m)
+        rows = [("GraphRAG", g_m), ("VectorRAG", v_m)]
 
-        for label, m in [("GraphRAG", g_m), ("VectorRAG", v_m)]:
-            print(f"{cve_id:<22} {len(gt):>4} {label:<12} {m['precision']:>6.2f} "
+        if rerank:
+            r_ret = _vector_retrieve_reranked(col, driver, cve_id, k=k, pool_size=rerank_pool)
+            entry["vector_reranked"] = r_ret
+            r_m = _metrics(r_ret, gt)
+            rerank_scores.append(r_m)
+            rows.append(("VectorRAG+Rerank", r_m))
+
+        retrieved_map[cve_id] = entry
+        for label, m in rows:
+            print(f"{cve_id:<22} {len(gt):>4} {label:<18} {m['precision']:>6.2f} "
                   f"{m['recall']:>8.2f} {m['fpr']:>7.2f}  "
                   f"{m['tp']}/{m['fp']}/{m['fn']}")
+        if rerank:
+            print(f"  [{i}/{len(evaluable)} CVEs scored]")
 
     driver.close()
 
@@ -347,17 +541,32 @@ def run_eval(k: int = 10, n_cves: int = 10) -> dict:
     v_fpr  = float(np.mean([s["fpr"]       for s in vector_scores]))
     delta  = g_prec - v_prec
 
+    r_prec = r_fpr = r_delta = None
+    if rerank and rerank_scores:
+        r_prec  = float(np.mean([s["precision"] for s in rerank_scores]))
+        r_fpr   = float(np.mean([s["fpr"]       for s in rerank_scores]))
+        r_delta = g_prec - r_prec
+
     print("\n" + "=" * 75)
     print("RETRIEVAL PRECISION SUMMARY")
     print(f"  Ground truth source: NVD CWE mapping + reference URLs + text keywords")
     print(f"  Evaluable CVEs: {len(evaluable)} / {len(test_cves)}")
-    print(f"  GraphRAG   mean P@{k}={g_prec:.3f}   mean FPR={g_fpr:.3f}")
-    print(f"  VectorRAG  mean P@{k}={v_prec:.3f}   mean FPR={v_fpr:.3f}")
-    print(f"  Delta P (GraphRAG - VectorRAG): {delta:+.3f}")
+    print(f"  GraphRAG          mean P@{k}={g_prec:.3f}   mean FPR={g_fpr:.3f}")
+    print(f"  VectorRAG (flat)  mean P@{k}={v_prec:.3f}   mean FPR={v_fpr:.3f}")
+    if rerank and rerank_scores:
+        print(f"  VectorRAG+Rerank  mean P@{k}={r_prec:.3f}   mean FPR={r_fpr:.3f}")
+    print(f"  Delta P (GraphRAG - VectorRAG flat):    {delta:+.3f}")
+    if rerank and rerank_scores:
+        print(f"  Delta P (GraphRAG - VectorRAG+Rerank):  {r_delta:+.3f}")
     if delta >= 0:
-        print("  [CLAIM SUPPORTED] GraphRAG precision >= VectorRAG on attack-path queries")
+        print("  [CLAIM SUPPORTED] GraphRAG precision >= flat VectorRAG on attack-path queries")
     else:
-        print("  [NOTE] VectorRAG matched GraphRAG on this sample")
+        print("  [NOTE] Flat VectorRAG matched GraphRAG on this sample")
+    if rerank and rerank_scores:
+        if r_delta >= 0:
+            print("  [CLAIM SUPPORTED, STRONGER BASELINE] GraphRAG precision >= reranked VectorRAG too")
+        else:
+            print("  [NOTE] Reranking closed the gap to GraphRAG on this sample")
     print("=" * 75)
 
     result = {
@@ -366,22 +575,21 @@ def run_eval(k: int = 10, n_cves: int = 10) -> dict:
         "total_test_cves":     len(test_cves),
         "nodes_indexed":       total_nodes,
         "k":                   k,
+        "rerank_pool_size":    rerank_pool if rerank else None,
         "graphrag_precision":  g_prec,
         "vector_precision":    v_prec,
         "graphrag_fpr":        g_fpr,
         "vector_fpr":          v_fpr,
         "delta_precision":     delta,
+        "vector_reranked_precision": r_prec,
+        "vector_reranked_fpr":       r_fpr,
+        "delta_precision_reranked":  r_delta,
         "per_cve": {
-            # R2.1 fix (2026-08-19): previously always [] -- a dead
-            # `if False else []` branch tried to re-call _graphrag_retrieve()
-            # with no arguments AFTER the driver was already closed, which
-            # would have raised if it had ever actually run. Now captured
-            # live inside the scoring loop above (retrieved_map), while the
-            # driver is still open, instead of a broken post-hoc re-fetch.
             cve_id: {
                 "ground_truth":       sorted(gt),
                 "graphrag_retrieved": sorted(retrieved_map[cve_id]["graphrag"]),
                 "vector_retrieved":   sorted(retrieved_map[cve_id]["vector"]),
+                "vector_reranked_retrieved": sorted(retrieved_map[cve_id].get("vector_reranked", [])),
             }
             for cve_id, gt in evaluable.items()
         },
@@ -408,15 +616,20 @@ if __name__ == "__main__":
                              "original pilot sample)")
     parser.add_argument("--k", type=int, default=10, help="Retrieval depth")
     parser.add_argument("--output", type=str, default="results/eval1_final.json")
+    parser.add_argument("--no-rerank", action="store_true",
+                        help="Skip the VectorRAG+Rerank arm (faster, no extra Qwen3 calls)")
+    parser.add_argument("--rerank-pool", type=int, default=_RERANK_POOL_SIZE,
+                        help="First-stage embedding candidate pool width before reranking")
     args = parser.parse_args()
 
     print("=" * 75)
-    print("ARGUS Eval 1 — Retrieval Precision (GraphRAG vs VectorRAG)")
+    print("ARGUS Eval 1 — Retrieval Precision (GraphRAG vs VectorRAG vs VectorRAG+Rerank)")
     print("Ground truth: NVD CWE IDs + ATT&CK reference URLs + keywords")
-    print(f"(n_cves={args.n_cves}, k={args.k} — builds nomic-embed-text index + "
-          f"NVD API calls, budget scales with n_cves)")
+    print(f"(n_cves={args.n_cves}, k={args.k}, rerank={'off' if args.no_rerank else f'on (pool={args.rerank_pool})'} "
+          f"— builds nomic-embed-text index + NVD API calls, budget scales with n_cves)")
     print("=" * 75)
-    result = run_eval(k=args.k, n_cves=args.n_cves)
+    result = run_eval(k=args.k, n_cves=args.n_cves, rerank=not args.no_rerank,
+                       rerank_pool=args.rerank_pool)
     if result:
         os.makedirs("results", exist_ok=True)
         with open(args.output, "w") as f:

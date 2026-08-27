@@ -19,7 +19,21 @@ def run_cmd(cmd, desc=""):
     print(f"  $ {cmd}")
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"  ERROR: {result.stderr[:200]}")
+        # Previously result.stderr[:200] -- a hard 200-char slice of buildkit's
+        # progress transcript, which starts with boilerplate ("#0 building
+        # with...", "#1 [internal] load build definition...") and puts the
+        # actual error near the END, not the start. That silently discarded
+        # the real error on every failure. Print the tail (where docker's own
+        # "ERROR: process ... did not complete successfully" block lives),
+        # not the head, and print a lot more of it.
+        print(f"  ERROR (exit {result.returncode}), stderr tail:")
+        tail = result.stderr.strip().split("\n")[-40:]
+        for line in tail:
+            print(f"    {line}")
+        if result.stdout.strip():
+            print(f"  stdout tail:")
+            for line in result.stdout.strip().split("\n")[-15:]:
+                print(f"    {line}")
         return False
     if result.stdout:
         lines = result.stdout.strip().split("\n")
@@ -76,7 +90,11 @@ CMD ["/usr/cyrus/bin/master", "-d"]
     import tempfile
     import os
 
-    tmpdir = tempfile.gettempdir()
+    # Isolated build context (not the whole %TEMP% dir -- that could be
+    # gigabytes of unrelated files, making "transferring context" slow or
+    # outright failing; neither Dockerfile COPYs/ADDs anything from the
+    # context anyway, everything comes from git clone / wget inside RUN).
+    tmpdir = tempfile.mkdtemp(prefix="argus_cyrus_build_")
     dockerfile_path = os.path.join(tmpdir, "Dockerfile.cyrus")
 
     print("\n[1] Creating Cyrus Dockerfile...")
@@ -158,7 +176,7 @@ CMD ["sh", "-c", "ulimit -n 1024; /usr/local/squid/bin/squid -f /usr/local/squid
     import tempfile
     import os
 
-    tmpdir = tempfile.gettempdir()
+    tmpdir = tempfile.mkdtemp(prefix="argus_squid_build_")
     dockerfile_path = os.path.join(tmpdir, "Dockerfile.squid")
 
     print("\n[1] Creating Squid Dockerfile...")

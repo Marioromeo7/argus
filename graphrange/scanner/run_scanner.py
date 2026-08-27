@@ -25,6 +25,50 @@ from graph.retrieval import get_driver
 SUPERVISOR_URL = "http://localhost:8000"
 BLUE_JOIN_TIMEOUT = 30
 
+# Only these severities get the expensive dynamic (red/blue) analysis --
+# found live 2026-08-25 on a real WebGoat scan: every one of 385 identified
+# vulnerabilities was getting the full treatment regardless of severity, at
+# 5-9x the compute cost of reasoning alone. Lower-severity findings still
+# appear in the report with their real static reasoning detail, just
+# without a live exploit attempt.
+_DYNAMIC_ANALYSIS_MIN_SEVERITY = {"Critical", "High"}
+
+
+def _cluster_key(vc: dict) -> tuple:
+    """ARGUS-SCANNER: Groups findings that are structurally the same
+    pattern -- found live 2026-08-25: WebGoat (deliberately, as a training
+    app) has many separate lesson variants of the same vuln_type/cwe. Only
+    one real representative per (vuln_type, cwe) gets full dynamic
+    verification; the rest reuse that real result by reference rather than
+    re-paying the same cost for what's structurally the same finding."""
+    return (vc.get("vuln_type", ""), vc.get("cwe", ""))
+
+
+def _skipped_red(vc: dict, reason: str) -> dict:
+    """ARGUS-SCANNER: A report-compatible placeholder matching
+    scanner_red.analyze()'s real return shape, for a finding that never
+    got dynamic analysis (low severity, or reusing a cluster
+    representative's real result instead)."""
+    return {
+        "vuln_context": vc, "matched_technique_id": "", "matched_cve_id": "",
+        "exploitation_path": "", "attack_steps": [], "attack_plan": {},
+        "execution_result": {"status": "skipped", "reason": reason, "phases": [],
+                              "kill_chain_complete": False, "final_service_reached": ""},
+        "source": "scanner_red",
+    }
+
+
+def _skipped_blue(vc: dict) -> dict:
+    """ARGUS-SCANNER: A report-compatible placeholder matching
+    scanner_blue.analyze()'s real return shape, paired with _skipped_red."""
+    return {
+        "vuln_context": vc, "code_fix": "", "detection_rule": "",
+        "static_advice": "", "execution_detected": False, "detection_events": [],
+        "argus_mitigations": [], "priority": vc.get("severity", "Low"),
+        "detected_overall": False, "phases_detected": [], "phases_missed": [],
+        "missed_lateral": False, "source": "scanner_blue",
+    }
+
 
 def _check_range_health() -> bool:
     """ARGUS-SCANNER: Verifies the GraphRange supervisor is reachable --
@@ -43,6 +87,19 @@ def _analyze_finding(vc: dict, topology: dict, driver, sandbox: bool) -> dict:
     blue's monitoring thread starts before red executes and only stops
     once red is done, so it actually observes red's activity rather than
     running sequentially after the fact.
+
+    stop_event.set() + blue_thread.join() are in a finally block -- found
+    live 2026-08-26/27: when red_analyze() raised (a dead Colab tunnel,
+    repeatedly, across many failed cluster attempts in a row), the
+    original code jumped straight out of this function on the exception,
+    NEVER reaching stop_event.set(). monitor_topology()'s per-service
+    threads only ever stop on that event, so each failed attempt left a
+    full set of live, non-daemon threads behind forever -- these block
+    the Python process from exiting even after the calling script prints
+    "DONE" and returns, which is exactly what produced multiple lingering
+    `resume_p2_3_webgoat.py` processes that looked "completed" (per their
+    own log) but never actually terminated, and kept racing each other to
+    write the same checkpoint file.
     """
     if not sandbox:
         red = red_analyze(vc, topology, driver, sandbox=False)
@@ -58,10 +115,11 @@ def _analyze_finding(vc: dict, topology: dict, driver, sandbox: bool) -> dict:
     blue_thread = threading.Thread(target=_run_blue_monitor)
     blue_thread.start()
 
-    red = red_analyze(vc, topology, driver, sandbox=True, supervisor_url=SUPERVISOR_URL)
-
-    stop_event.set()
-    blue_thread.join(timeout=BLUE_JOIN_TIMEOUT)
+    try:
+        red = red_analyze(vc, topology, driver, sandbox=True, supervisor_url=SUPERVISOR_URL)
+    finally:
+        stop_event.set()
+        blue_thread.join(timeout=BLUE_JOIN_TIMEOUT)
     shared_events = monitor_result.get("events", [])
 
     blue = blue_analyze(vc, red, topology, driver, sandbox=True, shared_events=shared_events)
@@ -116,20 +174,59 @@ def run_scanner(source: str, output_prefix: str = "reports/scanner") -> list:
         print(f"[Scanner] {len(flags)} flags found")
 
         print("[Scanner] Pass 2 — deep reasoning...")
-        vuln_contexts = reason_over_flags(flags)
-        print(f"[Scanner] {len(vuln_contexts)} vulnerabilities identified")
+        vuln_contexts = reason_over_flags(flags, repo_path=repo_path)
+        print(f"[Scanner] {len(vuln_contexts)} genuine vulnerabilities identified")
 
-        for i, vc in enumerate(vuln_contexts):
-            print(f"[Scanner] {i + 1}/{len(vuln_contexts)} "
-                  f"{vc.get('vuln_type', '?')} in {vc.get('filepath', '?')}")
+        to_analyze, low_severity = [], []
+        for vc in vuln_contexts:
+            (to_analyze if vc.get("severity") in _DYNAMIC_ANALYSIS_MIN_SEVERITY
+             else low_severity).append(vc)
+        print(f"[Scanner] {len(to_analyze)}/{len(vuln_contexts)} are Critical/High "
+              f"severity -- only these get full dynamic analysis")
+
+        clusters = {}
+        for vc in to_analyze:
+            clusters.setdefault(_cluster_key(vc), []).append(vc)
+        print(f"[Scanner] {len(to_analyze)} Critical/High findings cluster into "
+              f"{len(clusters)} distinct (vuln_type, cwe) pattern(s)")
+
+        for i, (key, group) in enumerate(clusters.items()):
+            representative = group[0]
+            print(f"[Scanner] {i + 1}/{len(clusters)} pattern {key} "
+                  f"({len(group)} similar finding(s)) -- analyzing "
+                  f"{representative.get('filepath', '?')}")
             # Same graceful-skip discipline as vuln_reasoner.py's
             # reason_over_flags() and file_scanner.py's scan_repo() -- one
             # finding's red/blue Ollama calls failing shouldn't crash the
             # whole scan and lose every finding already analyzed.
             try:
-                findings.append(_analyze_finding(vc, topology, driver, sandbox))
+                result = _analyze_finding(representative, topology, driver, sandbox)
             except Exception as e:
-                print(f"[Scanner] skipping {vc.get('filepath', '?')}: {e}")
+                print(f"[Scanner]   skipping {representative.get('filepath', '?')}: {e}")
+                continue
+            findings.append(result)
+            for other in group[1:]:
+                red = dict(_skipped_red(
+                    other, f"same pattern as {representative.get('filepath', '?')} "
+                           f"({key[0]}/{key[1]}) -- reusing that finding's real "
+                           f"dynamic-analysis result, not independently verified"))
+                red["matched_technique_id"] = result["red"].get("matched_technique_id", "")
+                red["matched_cve_id"] = result["red"].get("matched_cve_id", "")
+                red["execution_result"] = result["red"].get("execution_result", {})
+                blue = dict(_skipped_blue(other))
+                blue["code_fix"] = result["blue"].get("code_fix", "")
+                blue["detection_rule"] = result["blue"].get("detection_rule", "")
+                blue["static_advice"] = result["blue"].get("static_advice", "")
+                findings.append({"vuln_context": other, "red": red, "blue": blue})
+
+        for vc in low_severity:
+            findings.append({
+                "vuln_context": vc,
+                "red": _skipped_red(vc, f"severity {vc.get('severity', '?')} -- "
+                                         f"static analysis only, no dynamic "
+                                         f"verification attempted"),
+                "blue": _skipped_blue(vc),
+            })
 
         write_scanner_report(findings, output_prefix)
         print_summary()

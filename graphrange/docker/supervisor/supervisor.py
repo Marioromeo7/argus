@@ -1,9 +1,12 @@
 """
 ARGUS-LAYER-7: Supervisor — the "internet" and package broker for GraphRange.
 
-Runs inside the gr-supervisor container (docker.sock mounted) and exposes an
-HTTP API that red/blue agents (running outside Docker, in the host Python
-process, per agents/red.py + agents/blue.py) call to control the range.
+Spec text says this runs inside the gr-supervisor container (docker.sock
+mounted); in practice, per graphrange/run_scenario.py's own documented
+finding, every real execution in this project runs natively on the Windows
+host instead ("gr-supervisor" only resolves from inside a container) --
+exposes an HTTP API that red/blue agents (also host-native, per
+agents/red.py + agents/blue.py) call to control the range.
 """
 
 import os
@@ -11,10 +14,23 @@ import re
 import ast
 
 import docker
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from neo4j import GraphDatabase
 
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://host.docker.internal:7400")
+load_dotenv()
+
+# 2026-08-24 fix -- found live via a real P2.1 run: this module never called
+# load_dotenv(), so NEO4J_URI always fell through to the hardcoded
+# host.docker.internal default below regardless of .env's real
+# bolt://localhost:7400 -- correct from inside a container (the spec's
+# assumption), wrong for a host-native process (this project's actual
+# deployment, see the docstring above). Every /tool_request call opened a
+# Neo4j session that hung ~23s on a WinError 10060 connection timeout before
+# failing, which is what execute_attack() was actually seeing as
+# "supervisor_error" -- not a missing spawn_scenario() call (that was a
+# real, separate bug, fixed the same day, but insufficient on its own).
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7400")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "argus1234")
 NETWORK_NAME = os.getenv("GR_NETWORK", "graphrange-public")
@@ -333,9 +349,18 @@ _MYSQL_SOURCES = {
         "url": "https://snapshot.debian.org/file/c5e8fd1bf362e739e525b53698b3efa60fe45462",
         "src_dir": "mysql-3.22.32.orig",
     },
-    # VULNERABLE target for CVE-2000-0148 (<=3.22.31) -- source URL TBD (not on
-    # Debian snapshot). See victim_builder.py / ROADMAP P1.2.
-    # "3.22.30": {"url": "<FILL WHEN SOURCED>", "src_dir": "mysql-3.22.30"},
+    # VULNERABLE target for CVE-2000-0148: 3.22.30 -- see
+    # victim_builder.py's copy of this table for the full rationale (real
+    # NVD-listed CPE, closest version to the already-validated 3.22.32
+    # recipe, and why 3.21.33 -- the earlier guess whose source 404'd --
+    # was replaced rather than kept). This entry was itself the second
+    # half of the exact hand-sync gap that caused the 3.21.33 failure in
+    # the first place (found live 2026-08-24: this duplicate never got the
+    # first fix either) -- keep both copies in sync from now on.
+    "3.22.30": {
+        "url": "https://mirror.accum.se/mirror/archive/ftp.sunet.se/pub/vendor/sco/sco/skunkware/uw7/db/mysql/src/mysql-3.22.30.tar.gz",
+        "src_dir": "mysql-3.22.30",
+    },
 }
 
 
@@ -352,6 +377,12 @@ def _mysql_322_build_command(version: str, url: str, src_dir: str) -> str:
         f"cd {src_dir} && "
         "cp /usr/share/misc/config.guess /usr/share/misc/config.sub . && "
         "cp /usr/share/misc/config.guess /usr/share/misc/config.sub mit-pthreads/config/ && "
+        # Real root cause -- see victim_builder.py's copy of this function
+        # for the full account: the 3.22.30 source tarball ships a stale
+        # pre-populated config.cache (ac_cv_prog_CXX='CC', valid on
+        # whatever system cut the release, not this one). Deleting it forces
+        # a real, fresh detection instead of trusting it.
+        "rm -f config.cache && "
         "python3 - <<'PYEOF' && "
         "bash ./configure --prefix=/usr/local/mysql --without-debug && "
         "make && make install && "

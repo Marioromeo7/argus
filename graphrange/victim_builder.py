@@ -595,15 +595,28 @@ _MYSQL_SOURCES = {
         "url": "https://snapshot.debian.org/file/c5e8fd1bf362e739e525b53698b3efa60fe45462",
         "src_dir": "mysql-3.22.32.orig",
     },
-    # VULNERABLE target for CVE-2000-0148: 3.21.33. This version is vulnerable
-    # to the short-scramble password bypass (check_scramble() in sql/password.c
-    # compares only the client-supplied length, no minimum check -- a 1-byte
-    # scramble response bypasses auth in ~32 tries, no password required).
-    # Sourced from Internet Archive Wayback Machine (mysql.com archives from 1999).
-    # Downloaded + validated 2026-08-24 as part of P1.2 (MySQL recipe fix + authentic CVE demo).
-    "3.21.33": {
-        "url": "https://web.archive.org/web/19990601000000/mysql.com/Downloads/MySQL-3.21/mysql-3.21.33.tar.gz",
-        "src_dir": "mysql-3.21.33",
+    # VULNERABLE target for CVE-2000-0148: 3.22.30. check_scramble() in
+    # sql/password.c compares only the client-supplied length with no
+    # minimum-length check -- a 1-byte scramble response bypasses auth in
+    # ~32 tries, no password required. This is one of NVD's actual listed
+    # CPEs for the CVE (confirmed live against the NVD API 2026-08-24:
+    # 3.22.26, 3.22.27, 3.22.29, 3.22.30, 3.23.8-10 -- 3.21.33 was NEVER on
+    # that list; it was an earlier, unverified guess this project made
+    # before checking NVD directly, and its sourced URL turned out to 404
+    # anyway). 3.22.30 is also the closest vulnerable version to 3.22.32
+    # (two patch releases earlier, same minor branch) -- the version this
+    # project already has a fully validated 12-patch build recipe for, so
+    # good odds the same patches mostly apply.
+    #
+    # Source found and verified 2026-08-24 (by the user, not an automated
+    # guess): a real Sunet/SCO Skunkware mirror, not mysql.com or Wayback
+    # Machine. Verified before trusting it -- real gzip, 4,452,506 bytes,
+    # 2030 files, top-level dir exactly `mysql-3.22.30/`, and
+    # sql/password.c's real check_scramble() present with the documented
+    # unbounded scramble-comparison loop.
+    "3.22.30": {
+        "url": "https://mirror.accum.se/mirror/archive/ftp.sunet.se/pub/vendor/sco/sco/skunkware/uw7/db/mysql/src/mysql-3.22.30.tar.gz",
+        "src_dir": "mysql-3.22.30",
     },
 }
 
@@ -632,6 +645,26 @@ def _mysql_322_build_command(version: str, url: str, src_dir: str) -> str:
         f"cd {src_dir} && "
         "cp /usr/share/misc/config.guess /usr/share/misc/config.sub . && "
         "cp /usr/share/misc/config.guess /usr/share/misc/config.sub mit-pthreads/config/ && "
+        # Real root cause, found live 2026-08-24 building 3.22.30 (3.22.32
+        # never hit this): the source tarball SHIPS a pre-populated
+        # `config.cache` (confirmed via `tar tzf`, not assumed -- it's a
+        # real file in the distribution, `mysql-3.22.30/config.cache`),
+        # almost certainly left over from the original maintainer's own
+        # build system circa 2000. It contains
+        # `ac_cv_prog_CXX=${ac_cv_prog_CXX='CC'}` with `ac_cv_prog_cxx_works
+        # ='yes'` -- true on whatever system cut this release (likely one
+        # with a real Sun/SGI/HP-UX-style `CC` binary), false here. Because
+        # autoconf's caching check tests "is this variable already set"
+        # BEFORE it ever looks at $CXX or does a real search, neither a
+        # `CC`-named PATH wrapper (first attempt: fixed the immediate error
+        # but broke an unrelated later C-only test, root cause not fully
+        # chased once this was found) nor a pre-exported $CXX env var
+        # (second attempt: silently ignored, same reason) can override a
+        # value the shipped cache already answered. Deleting the stale
+        # cache is the actual fix -- forces a real, fresh detection against
+        # this system instead of trusting 25-year-old assumptions from a
+        # different one. Harmless for versions that don't ship one.
+        "rm -f config.cache && "
         # Everything chained with '&&' has to be on this same logical shell
         # line, BEFORE the heredoc body -- a heredoc's terminator can't be
         # followed by '&&' on its own line (nothing may precede '&&'), so

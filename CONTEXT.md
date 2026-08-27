@@ -1,6 +1,18 @@
 # ARGUS — Project Context File
 *For Claude Chat: read this to understand current project state.*
 
+> **Note, 2026-08-24**: the "Evaluation Results (completed 2026-05-28/29)"
+> section below is the original v0 six-layer prototype's results and is
+> still accurate as a historical record. A later evaluation push (R2,
+> 2026-08-22 through 2026-08-24) added a real 44-CVE retrieval-precision run,
+> a real 73-node grain-convergence sweep, and extended co-evolution to 100
+> cycles — see the "R2 Evaluation Results" section further down, which was
+> independently re-verified against the raw `results/` files after the
+> narrative summary docs written during that push turned out to overstate
+> what those files actually support (or, for retrieval precision, be
+> circular by construction). `PAPER_CLAIMS.md` and `PAPER_DRAFT.md` §5 were
+> corrected to match on the same date.
+
 ---
 
 ## What ARGUS Is
@@ -207,9 +219,12 @@ Notable pattern: attack confidence dips to 0.50 at cycles 15–17 and 26 — red
 
 ## Paper Claims (final status)
 
-1. **Retrieval precision**: GraphRAG P@10=0.083 > VectorRAG P@10=0.000 — structural traversal outperforms semantic similarity. ✓
-2. **Grain convergence**: 0.30→0.90 over 3 rounds, total Δ+0.60, monotonically non-decreasing. ✓
-3. **Co-evolutionary dynamics**: agents converge to equilibrium (atk μ=0.82, mit μ=0.91) with strategic oscillation as evidence of genuine adaptation. ✓ (reframed from "p < 0.05 upward trend")
+*Updated 2026-08-24 — see the "R2 Evaluation Results" section above and
+[PAPER_CLAIMS.md](PAPER_CLAIMS.md) for the full evidence.*
+
+1. **Retrieval precision**: original small pilot GraphRAG P@10=0.083 > VectorRAG P@10=0.000 (6/10 CVEs) still stands; superseded by a real 44-CVE run, GraphRAG P@10=0.176 vs flat VectorRAG 0.039 vs reranked VectorRAG 0.057 — structural traversal outperforms semantic similarity at real scale. ✓ (a 2026-08-23 attempt to scale it via backfilled edges was invalid — circular ground truth — and is excluded)
+2. **Grain convergence**: original small pilot 0.30→0.90 over 3 rounds (Δ+0.60) still stands; superseded by a real population-scale sweep of all 73 CVE/technique nodes, 0.300→0.354 (+18.0%), right-shifted distribution — though not uniformly monotonic at the node level (37/73 nodes individually regressed). ✓
+3. **Co-evolutionary dynamics**: agents converge to equilibrium (atk μ=0.82, mit μ=0.91) with strategic oscillation as evidence of genuine adaptation. ✓ (reframed from "p < 0.05 upward trend") — re-verified on a real 100-cycle extension (attack p=0.221, mitigation p=0.134): still equilibrium, not significant, now on 2× the data.
 4. **Hardware feasibility**: full prototype on RTX 3050 4GB VRAM + 16GB RAM. ✓
 
 ---
@@ -278,6 +293,118 @@ Episodic memories accumulated: 178 (was 120 before fix)
 
 ---
 
+## R2 Evaluation Results (2026-08-22 to 2026-08-24) — independently re-verified
+
+The R1/R2 push ran three sub-evaluations at larger scale than the original v0 evals
+above. Numbers here come from directly recomputing against the raw checkpoint/log
+files in `results/`, not from the narrative summary docs written during the same
+push (`results/R2_EVALUATION_COMPLETE.md` and siblings) — those overstated what the
+underlying data actually supports in two of the three cases. Full reconciliation in
+[ROADMAP.md](ROADMAP.md)'s R2 section.
+
+### R2.1 — Retrieval precision: real, 44 CVEs (`results/r2_1_full_52cves.json`)
+
+A 2026-08-23 attempt to scale Eval 1 to 12 CVEs (`scripts/backfill_simple.py` +
+`scripts/eval_backfilled.py`) wrote the evaluation's own ground-truth
+CVE→technique pairs into the graph as edges, then measured GraphRAG precision
+by retrieving those same edges back out — ground truth was not independent of
+the graph. The reported "27.04% vs 0%, +138%" is circular by construction and
+was excluded.
+
+Superseded 2026-08-24 by a real run at the ≥50-CVE scale, after fixing the
+actual retrieval mechanism (not just the sample size). Found via a live
+rank-position audit: with CVE and technique/tactic nodes in one
+undifferentiated searchable index, the correct ground-truth technique ranked
+#545 of 783 candidates for one CVE and #184 of 783 for another — CVE
+descriptions are far more textually similar to *other CVE descriptions*
+than to ATT&CK's "Adversaries may..." prose, so same-type nodes dominated
+nearest-neighbor retrieval regardless of topical relevance. A recall
+failure, not a ranking failure — confirmed by adding a two-stage
+retrieve-then-rerank baseline (Qwen3 reranking a 30-candidate embedding
+pool) that made no difference until the search was restricted to
+technique/tactic-type nodes only, mirroring what GraphRAG's own graph
+traversal already restricts to. Also fixed: an unindexed `LIMIT 500`
+silently excluding up to 285 of 785 real nodes, and an NVD rate-limit
+pacing bug dropping half the ground-truth lookups.
+
+```
+44/52 evaluable CVEs (8 dropped for no NVD-derivable ground truth)
+GraphRAG:              mean P@10=0.176  mean FPR=0.824
+VectorRAG (flat):      mean P@10=0.039  mean FPR=0.961
+VectorRAG (reranked):  mean P@10=0.057  mean FPR=0.943
+Delta (GraphRAG - flat):     +0.137
+Delta (GraphRAG - reranked): +0.119
+```
+
+GraphRAG beats both VectorRAG variants; reranking measurably helps the
+vector baseline but doesn't close the gap. **[CLAIM SUPPORTED]** at real
+≥50-CVE scale — this is now the primary retrieval-precision evidence,
+superseding the original 6/10-CVE pilot. Still P@10 only, not the full
+P@k/MRR/nDCG@10/bootstrapped-CI battery `docs/EVALUATION_PLAN.md` #7
+specifies — those need ranked, not set, retrieval results, still open.
+
+### R2.2 — Grain convergence: real, population scale (`results/r2_2_grain_73nodes_checkpoint.json`)
+
+Full target scope — all 73/73 CVE/technique nodes with a technique edge,
+swept with the narrowing engine (`challenge_node_v2`, `agents/narrowing.py`),
+live Neo4j writes, resumed across several genuine mid-run crashes via
+checkpointing. Verified by recomputing directly from the JSON, not the
+summary doc:
+
+```
+Before: mean=0.300  std=0.000   (all 73 nodes at seed)
+After:  mean=0.354  std=0.291   (+18.0%)
+
+Distribution (after):
+  0.0-0.2: 28   0.2-0.4: 22   0.4-0.6: 2   0.6-0.8: 13   0.8-1.0: 8
+Status: 23 resolved, 40 stalled, 9 partial, 1 skipped
+```
+
+**Caveat, not a contradiction**: convergence is not uniformly monotonic at the
+node level — 37/73 nodes (50.7%) ended below their 0.3 seed, consistent with
+the confidence formula's freshness term pulling an individual node down on a
+round where the asker outpaces the answerer, even while cumulative trust
+stays healthy. The population-level rightward shift is the real evidence;
+per-node monotonicity is not claimed.
+
+A separate, incomplete checkpoint (`results/grain_sweep_checkpoint.json`,
+dated a day *after* this one finished, only 14/50 nodes complete) was used by
+the narrative summary docs to report "+24.9%, n=50" — re-averaging those 14
+nodes actually gives **-17.9%** (0.182→0.150), not +24.9%. That number does
+not belong anywhere citable; use the 73-node result above instead.
+**[CLAIM SUPPORTED]**, at population scale.
+
+### R2.3 — Co-evolution: extended to 100 cycles, still not significant (`results/coevolution_50.json`)
+
+The original 50-cycle run (above) has been extended to a real, complete 100
+cycles — confirmed via `cycles_completed: 100` in the checkpoint and a clean
+`[DONE] All 100 cycles complete` in `results/r2_3_100.log`. Re-running the
+same regression method the project's own script uses
+(`scipy.stats.linregress` against the cycle index) directly on the complete
+arrays:
+
+```
+Attack confidence:       mean=0.832  std=0.147  slope=+0.00063/cycle  R2=0.015  p=0.221
+Mitigation effectiveness: mean=0.884  std=0.068  slope=+0.00036/cycle  R2=0.023  p=0.134
+```
+
+Neither reaches p<0.05. A narrative summary produced during the run itself
+reported the attack trend as significant at p=0.0395 under a "90/100 cycles,
+infrastructure ceiling" framing — that does not reproduce against the actual
+completed 100-cycle data or the project's own regression code; the closest
+reconstruction is an undisclosed one-tailed test on a stale 90-cycle subset
+of what had, by completion, become a 100-cycle series. **Honest conclusion,
+now on 2× the original sample: still co-evolutionary equilibrium, not
+significant improvement** — both slopes small and positive, oscillation
+persists. Doubling the cycle count did not resolve it into a trend, which
+strengthens rather than weakens the equilibrium reading. **[CLAIM PARTIALLY
+SUPPORTED]**, same status as the original 50-cycle run, now with twice the
+evidence behind it. The ≥150-cycle target and the stationarity /
+change-point / cross-correlation battery ROADMAP.md's R2.3 specifies remain
+open.
+
+---
+
 ## What NOT To Do
 
 - No cloud APIs (no Groq, OpenAI, Anthropic) until Phase 3 benchmarking
@@ -293,9 +420,12 @@ Episodic memories accumulated: 178 (was 120 before fix)
 
 ## What's Next (Phase 2)
 
-- Write the research paper sections (architecture, experiments, results)
-- Reframe eval 3 co-evolution claim in paper (equilibrium dynamics, not monotonic improvement)
+- Write the research paper sections (architecture, experiments, results) — `PAPER_DRAFT.md` has a working draft, updated 2026-08-24 with the real R2 results
+- Reframe eval 3 co-evolution claim in paper (equilibrium dynamics, not monotonic improvement) — done, now backed by the 100-cycle re-verification above
 - Phase 3: add Groq as comparison baseline for benchmarking (not yet)
-- Consider running challenger on all 73 CVEs to improve grain distribution before paper submission
+- ~~Consider running challenger on all 73 CVEs to improve grain distribution before paper submission~~ — done 2026-08-22, see R2.2 above
+- ~~Scale retrieval precision (Claim 1) to a real ≥50-CVE run with ground truth kept independent of the graph~~ — done 2026-08-24, see R2.1 above (44/52 evaluable CVEs)
+- Retrieval precision still needs the full P@k/MRR/nDCG@10/bootstrapped-CI battery beyond the P@10 result already in hand (`docs/EVALUATION_PLAN.md` #7) — needs ranked, not set, retrieval results, a real design change.
+- Co-evolution needs the ≥150-cycle run + stationarity/change-point/cross-correlation battery (ROADMAP.md R2.3) to test the equilibrium hypothesis directly rather than only via a linear-trend p-value.
 
 The working directory is `d:\argus`. Run everything with `conda activate argus` first.
