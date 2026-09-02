@@ -117,6 +117,15 @@ def reason_over_flags(flags: list, repo_path: str | None = None) -> list:
         if key and key in checkpoint:
             already_done += 1
             cached = checkpoint[key]
+            # _reason_block()'s own JSON schema never asks the model to echo
+            # the code back, so it was never in the context at all -- found
+            # live 2026-08-29 on the finished WebGoat report: every single
+            # finding's "### Code" section was empty. The real snippet is
+            # already sitting on the Pass 1 flag being iterated right now
+            # (same key => same source location), so copy it in directly
+            # rather than asking the LLM to reproduce code verbatim (slower,
+            # and risks it paraphrasing/mangling the snippet).
+            cached["code_block"] = flag.get("code_block", "")
             if cached.get("is_genuine_finding", True):
                 contexts.append(cached)
             else:
@@ -148,6 +157,7 @@ def reason_over_flags(flags: list, repo_path: str | None = None) -> list:
             _log(f"skipping {flag_to_reason.get('filepath', '?')}: {e}")
             continue
 
+        context["code_block"] = flag.get("code_block", "")
         if key:
             checkpoint[key] = context
             newly_completed += 1

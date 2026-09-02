@@ -945,6 +945,269 @@ final spec state, not every intermediate version.
       (code path exists in `scanner_red.py`'s `_request_tool_for_phase()`,
       not yet exercised by a real blocked phase since that needs a live run)
 
+### Pass 3 dynamic-analysis validation & fixes (2026-08-29 → 2026-09-02)
+
+A real, full WebGoat scan (385 flags → 210 genuine findings → 136
+`(vuln_type, cwe)` clusters) surfaced a chain of real bugs in the
+red-agent execution path, each found by reading actual output rather than
+trusting the mechanism worked. Documented here in order found, since each
+fix depended on the last one's finding.
+
+- [x] **2026-08-29 — `_assess_objective()`'s false-success bug.** Found live
+      reviewing a completed WebGoat report: the old tie-break treated
+      "stdout non-empty and no hard-failure string" as ground truth that
+      overrode Qwen's own dissenting read, logging the disagreement as a
+      `conflict` but never honoring it. Fired on 53% of phases in that
+      report, including a phase that "achieved" a Dockerfile-permissions
+      objective because the tool that ran was a *code editor* that printed
+      something. **Fixed**: `achieved = execution_success AND
+      qwen_achieved` (both signals must agree); added `exploit_condition`
+      to `_plan_attack_path()`'s per-phase schema — a concrete, checkable
+      description of what success evidence would actually look like for
+      *that* vulnerability, given to Qwen instead of a vague restated
+      objective. Re-validated on a full re-run: conflict rate dropped
+      53%→25%, success rate dropped to an honest 2% (183 phases, 45
+      conflicts, 3 successes) — more conservative, not a regression.
+- [x] **2026-08-31 — tool-selection mismatch.** Audited the same report's
+      real tool usage: 87% of attempts used a tool with zero relevance to
+      the vulnerability under test (a code editor for an IDOR bypass, a
+      Windows/AD credential tool for a CSRF forgery). Root cause, found via
+      live data inspection not assumption: the tool graph's "exploitation"
+      bucket holds 148 tools all crawled at the identical
+      `grain_confidence=0.8`, so `ORDER BY grain_confidence DESC LIMIT 1`
+      picks essentially arbitrarily among them; separately, `code-oss` was
+      genuinely mistagged `capability='exploitation'` by the crawler.
+      **Fixed**: `_technique_tool_override()` — a small, hand-verified
+      keyword→tool table (`_TECHNIQUE_TOOL_OVERRIDES`) checked before the
+      generic capability search, mapping sqli→sqlmap, xss→xsser,
+      cmdi→commix, padding-oracle→padbuster. Three tools with no apt
+      package (so the Kali-crawl-only tool graph never had a chance to
+      find them) added by hand with real install commands: `jwt_tool`,
+      `ysoserial`, `xxeinjector`. CSRF/IDOR initially mapped to `burpsuite`
+      (a real crawled tool) on the theory both are proxy-tool features —
+      corrected 2026-09-01 (see below) once it turned out burpsuite has no
+      headless CLI mode at all. `code-oss`'s mistag corrected directly in
+      the graph.
+- [x] **2026-08-31 → 2026-09-01 — full 136-cluster re-validation, real
+      compute-rotation saga.** Re-ran Pass 3 end to end against the
+      tool-mapping fix. account1's Colab tunnel got 44/136 clusters before
+      dying (GPU quota exhausted from the run itself); rotated to
+      account2, got to 90/136 before the same thing; account3 refused
+      outright (already exhausted); finished the remaining 46 on local
+      qwen3:8b overnight. Verified complete via a direct checkpoint diff
+      against the old pre-fix checkpoint's 136 keys — zero missing.
+      **Real final numbers**: of 80 phases that actually acquired a
+      tool, distribution is now genuinely relevant per class (`burpsuite`
+      19, `jwt_tool` 17, `xsser` 8, `ysoserial` 6, `xxeinjector` 4,
+      `sqlmap` 2, `commix` 1, plus generic fallbacks for uncovered
+      categories) — confirmed live for jwt/deserialization/XXE/CSRF/IDOR
+      cases via direct checkpoint reads during the run, not just the
+      final tally. **Honest, harder finding**: all 80 attempted phases
+      showed `execution_evidence=True, qwen_signal=False` — a 100%
+      conflict rate among real attempts, 0 fully-achieved exploits, even
+      with the *right* tool every time. This motivated the next
+      investigation.
+- [x] **2026-09-01 — root cause of the 0%: tools were invoked by bare name.**
+      Traced `_exec_in_container()`'s call site: `stdout =
+      _exec_in_container(supervisor_url, container_name, active_tool)`
+      ran `sh -c sqlmap` (etc.) — no target URL, no injection parameter,
+      no payload. Confirmed live: this just prints the tool's own usage
+      banner (non-empty stdout, no hard-failure marker, so
+      `execution_success=True`) without ever touching the network. Right
+      tool selection (the 08-31 fix) solved *which* tool; this is the
+      separate, deeper gap of *how it gets invoked*.
+- [x] **2026-09-01 — general fix: build the dynamic-analysis victim from
+      its own source, not an inferred public image.** Investigating why a
+      real login (using the real hardcoded creds in
+      `DefaultUserInitializer.java`, a finding Pass 1 had already flagged)
+      failed against a live WebGoat container led to a bigger discovery:
+      the container was `webgoat/webgoat:latest` from Docker Hub — version
+      24.04, built 2025-03-11 — while the statically-analyzed checkout was
+      a commit from 2026-08-14, over a year newer. Confirmed via `docker
+      inspect`/`git log`. Root cause: real WebGoat ships no
+      `docker-compose.yml`; `victim_builder.py` falls back to inferring
+      one from README hints, which reasonably (but not commit-accurately)
+      picks the documented public image. **This isn't WebGoat-specific —
+      any repo without its own compose file hits the same risk**: every
+      dynamic-verification result for such a repo may be checked against
+      code that doesn't match what Pass 1/2 flagged. Fixed generally in
+      `victim_builder.py`: new step between "use a real compose file" and
+      "infer one via Qwen" — `_try_build_from_dockerfile()` tries `docker
+      build .` from the repo's own Dockerfile first (works immediately for
+      self-contained multi-stage builds); on failure, detects the
+      ecosystem and runs a real pre-build step (`_prebuild_from_source()`,
+      `_SOURCE_BUILD_MAP`: maven/gradle/node/go/rust) in a throwaway
+      builder container before retrying once; falls back to the existing
+      manifest+Qwen path unchanged if source-building genuinely fails, so
+      this never blocks a scan. Two real sub-bugs found and fixed getting
+      this to actually work: (1) a fixed builder JDK tag
+      (`maven:3.9-eclipse-temurin-21`) failed outright against WebGoat's
+      real `<java.version>25</java.version>` — fixed by detecting the
+      required version from the manifest itself
+      (`_detect_java_version()`), falling back to the fixed tag only if
+      the version-specific one doesn't exist on Docker Hub; (2) the
+      original error log only captured `stderr`, which Maven leaves empty
+      even on a real compile failure (it writes to stdout) — masked the
+      real error as a blank message, fixed by logging combined output.
+      Added persistent named cache volumes per ecosystem
+      (`argus-maven-cache` etc.) so a retry or a later re-run against the
+      same repo doesn't re-download the entire dependency tree from zero.
+      **Live-verified end to end**: built `argus-victim-webgoat-1787667206`
+      from real source (Maven pre-build + `docker build`), confirmed the
+      image's creation timestamp matches the actual build time (not a
+      stale layer), and — critically — the real hardcoded credentials NOW
+      work: login against this container returns `302 → .../welcome.mvc`
+      (previously `302 → .../login?error` against the version-mismatched
+      public image).
+- [x] **2026-09-01 — real attacker-container architecture.** Found while
+      fixing the invocation-bare-name bug: the Scanner had no separate
+      attacker container at all — `scanner_red.py` delivered tools
+      straight into the *target repo's own app container* and exec'd them
+      there, attacking itself via localhost. This both mutated the
+      container under test and made a real target URL unbuildable (no
+      network hop, "localhost" reveals nothing about which service/port).
+      GraphRange's original Layer 7 design (`supervisor.py`'s
+      `spawn_scenario()`) already solves this with real, separate
+      red/blue/victim containers on one shared Docker network — the
+      Scanner never wired into it, since its arbitrary per-scan target
+      networks aren't a fixed CPE-resolved image the way GraphRange's are.
+      **Fixed**: `spawn_attacker_container()`/`teardown_one()` in
+      `supervisor.py` — spins up one `graphrange-red`-image container per
+      cluster, connected to every target service's real Docker network(s)
+      (so it reaches them via Compose's own service-name DNS alias), torn
+      down after; `scanner_red.py`'s `_spawn_attacker()`/
+      `_teardown_attacker()` call these, and `_execute_attack_plan()` now
+      delivers/execs tools in the attacker container while still reading
+      `phase["service"]` as the victim for URL/port resolution. One real
+      bug found live wiring this: Docker container lookup needs the real
+      `container_id`/full container name — the bare compose service name
+      is only a DNS *alias*, not something `docker_client.containers.get()`
+      resolves (confirmed via a live `NotFound`) — fixed to use
+      topology's `container_id` field. **Live-verified**: spawned a real
+      attacker container, joined it to WebGoat's network, ran `curl` from
+      it against `http://webgoat-1787667206:8080/...` and got a real
+      `HTTP 200` — genuine cross-container reachability, not assumed.
+- [x] **2026-09-01 — `usage_pattern` tool-node field + real invocation
+      building.** User-proposed design: add a field to tool nodes
+      describing *how* to invoke them (a "payload carried in the node"),
+      deliberately kept out of tool *selection* (capability matching is
+      unchanged) — consulted only after a tool is already chosen. Added
+      `usage_pattern` (free-text CLI-usage description) to sqlmap, xsser,
+      commix, padbuster, jwt_tool, ysoserial, xxeinjector, and a new
+      `curl` node (replacing burpsuite for CSRF/IDOR — burpsuite turned
+      out to have no headless CLI mode at all; CSRF/IDOR are really just
+      direct HTTP request construction, which curl's own `usage_pattern`
+      now documents). New `_build_invocation()` in `scanner_red.py`: given
+      the tool's `usage_pattern` + the finding's `code_block`/description
+      + the target's real Docker-network URL, asks Qwen for one fully-armed
+      shell command (may chain steps with `&&`/`$()` for tools like
+      ysoserial that only generate a payload, needing a separate curl
+      delivery) — replacing the bare-tool-name invocation entirely.
+      **Live-verified against real, source-matched WebGoat**: produced
+      `sqlmap -u "http://webgoat:8080/sqlInjection/login" -p name --batch
+      --dump` — wrong endpoint guess (real route is `POST
+      /WebGoat/SqlInjection/attack3`, param `query`), but running it for
+      real got a genuine `404` from sqlmap's own real HTTP request — a
+      correct, honest failure signal, a real step up from a bare tool name
+      that never touched the network at all.
+- [x] **2026-09-01 — credential discovery, authentication, and route
+      discovery.** The wrong-endpoint guess above exposed two further
+      gaps: (1) no route/context-path awareness (WebGoat mounts everything
+      under `/WebGoat`, invisible in a source snippet alone) and (2) most
+      endpoints need an authenticated session first. Fixed as a
+      one-time-per-scenario step:
+      - `_find_hardcoded_credentials()` — scans *all* findings in the scan
+        (not just the current cluster) for a CWE-798/hardcoded-credential
+        finding and extracts the real literal username/password via Qwen.
+        Turns an already-detected finding into the key that unlocks
+        testing every other authenticated endpoint. Live-verified:
+        correctly extracted `webgoat-admin`/`webgoat`.
+      - `_discover_routes()` — real, general route discovery: delivers
+        `dirb` into the attacker container and brute-forces the live
+        target, general across any framework (unlike Spring's
+        `/actuator/mappings`, which is real but framework-specific *and*
+        itself auth-gated — confirmed live, a 302 to login). Used as the
+        fallback when the cheap signal below doesn't pan out.
+      - Cheaper first signal, `topology["repo_name"]` — the staging
+        directory's basename preserves the repo's real, correctly-cased
+        name (`repo_intake.py` names it straight from the clone
+        URL/path, before anything downstream lowercases it for
+        Docker-safe service naming) — added as a new `_parse_topology()`
+        field. A strong, nearly-free signal for self-branded apps that
+        mount under their own project name (`WebGoat` → `/WebGoat`,
+        confirmed live to be exactly right on the first try — dirb's own
+        wordlist has no entry for "webgoat" at all, confirmed via direct
+        grep, so blind brute-force alone would *not* have found this).
+      - `_authenticate()` — tries common login paths, prefixed by the
+        discovered/hinted base path(s), with the two most common field-
+        name conventions; judges success by the POST's redirect NOT going
+        back to a path containing "error" (confirmed live: WebGoat's real
+        failure redirects to `.../login?error`, a real success to
+        `.../welcome.mvc`). Returns a cookie-jar path threaded into both
+        `_build_invocation()` (via a new `cookie_jar` param, attached with
+        `-b`) and login-path selection (via `path_hints`).
+      **Live-verified end to end, the full chain in one run**: credential
+      extraction → real attacker spawn → authentication (cookie jar
+      populated, using the `/WebGoat` repo-name hint) →
+      `_build_invocation()` for an IDOR finding produced `curl -X GET
+      http://webgoat-1787667206:8080/WebGoat/editProfile/123 -b
+      /tmp/argus_session.txt` — correct context-path prefix *and* a real
+      authenticated session in one command.
+
+      **Honest open gaps, not yet closed**: (1) the exact endpoint path
+      *within* a correctly-discovered base is still a Qwen guess from
+      limited code context, not full enumeration — probabilistic, not
+      solved; (2) multi-step chains (JWT forge-then-replay, deserialize-
+      then-deliver) are structurally expressible as one chained shell
+      command now, but unvalidated at scale — only spot-tested on
+      individual cases; (3) **the full fix stack above (source-build +
+      attacker container + `usage_pattern` + auth/route-discovery) has
+      never been re-run against the complete 136-cluster set together** —
+      every verification so far is a targeted, manual live test, not a
+      fresh end-to-end report. That full re-validation is the natural
+      next step before trusting an updated success-rate number for the
+      report.
+- [x] **2026-09-01 — attacker-image tool-dependency gaps.** Attempting the
+      full re-validation run surfaced a fourth bug class: ysoserial and
+      jwt_tool's real stdout showed they never actually ran (`java: not
+      found`, `ModuleNotFoundError`), not that the exploit failed — every
+      earlier "tool fired correctly" checkpoint had only confirmed tool
+      *selection*, never that its install succeeded. Root cause: the
+      `graphrange-red` base image only ever had `python3`/`pip`/`curl`/
+      `wget` — no JVM, no Ruby, and critically no `git` at all (git being
+      missing had silently broken jwt_tool's install for this entire
+      multi-day saga). Fixed: `git` added to the base Dockerfile (image
+      rebuilt); ysoserial's `install_command` now also installs
+      `default-jre-headless`; xxeinjector's also installs `ruby`;
+      jwt_tool's `pip install` now passes `--break-system-packages` (Kali's
+      Python is PEP-668 externally-managed, plain `pip install` is refused
+      otherwise). All three re-verified live post-fix with real
+      usage-banner stdout, not an error.
+- [x] **2026-09-01 — placeholder-value bug in `_build_invocation()`.**
+      Live reproduction of a JWT phase showed Qwen generating commands with
+      literal bracketed placeholders (`<captured_token>`, `<cracked_secret>`)
+      for values that only exist on the live target, which the shell then
+      misread as input-redirection syntax (`sh: 1: cannot open
+      captured_token: No such file`). Fixed via an explicit prompt
+      instruction to chain a real capture step (`TOKEN=$(curl ... |
+      grep -oP '...') && ...`) instead of ever leaving a placeholder.
+      Syntax-verified in isolation; not yet confirmed live at scale (see
+      below).
+- [ ] **2026-09-02 — full 136-cluster re-validation attempted, invalid
+      result.** With the complete fix stack active (source-build,
+      attacker-container, `usage_pattern`, auth/route-discovery, all three
+      tool-dependency fixes, and the placeholder-value fix), the dynamic
+      checkpoint was cleared and a genuinely fresh run launched
+      (`results/p2_3_webgoat_resume25_full_stack.log`). Real conflicts
+      scored correctly for the first 2-3 clusters, but the Ollama tunnel
+      (Colab account2, session `3053b7`) died around pattern 7-8 and never
+      recovered — confirmed via a real SSH 404 (genuine death, not a
+      blip). The run still exited 0, but ~128 of 136 patterns skipped with
+      `connection refused`, so the final "23 findings" total is not a real
+      result. **The full-stack re-validation is still outstanding** — this
+      attempt does not count as evidence either way for the post-fix
+      success rate.
+
 ### Dashboard extensions
 - [~] Extend `dashboard/api/main.py` — `/api/telemetry`, `/api/llm/navigate`.
       Built 2026-08-10. `/api/telemetry` verified live: started the real

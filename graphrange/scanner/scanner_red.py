@@ -13,12 +13,14 @@ BACKLOG.md's own note that later passes supersede earlier ones.
 import json
 import os
 import re
+import uuid
 from datetime import datetime
 
 import requests
 
 from graphrange.telemetry import track, count_tokens, patch_last_tokens_out
 from graphrange.observer import normalize
+from graphrange.tool_graph import get_tool_by_name
 from config import OLLAMA_CHAT_URL as OLLAMA_URL
 
 QWEN_MODEL = "qwen3:8b"
@@ -44,6 +46,62 @@ _CAPABILITY_BROADEN_MAP = [
     (("exfil", "dump", "extract"), "exfiltration"),
     (("crack", "brute", "auth"), "credential_access"),
 ]
+
+# ARGUS-SCANNER: technique-specific overrides, checked before the generic
+# capability-category search. Found live 2026-08-31 auditing a completed
+# WebGoat report: the tool graph's "exploitation" bucket alone holds 148
+# tools all tied at the same crawled grain_confidence (0.8), so
+# `ORDER BY grain_confidence DESC LIMIT 1` picks essentially arbitrarily
+# among them -- 87% of real attack attempts in that report used a tool
+# with zero relevance to the vulnerability under test (a code editor for
+# an IDOR bypass, a Windows/AD credential tool for a CSRF forgery), not
+# because the graph lacks good tools (it has real ones: sqlmap, xsser,
+# commix, padbuster) but because nothing in the lookup discriminated among
+# 148 tied candidates. Every tool name here was verified present in the
+# live tool graph before being added (`graph/retrieval.py` query, not
+# guessed). Matched against the phase's own objective/capability text,
+# which `_plan_attack_path()` now grounds in the real vulnerability -- if
+# none of these fire, the existing generic category search still runs
+# unchanged, so this only narrows cases it can actually improve.
+_TECHNIQUE_TOOL_OVERRIDES = [
+    (("sql injection", "sqli"), "sqlmap"),
+    (("cross-site scripting", "xss"), "xsser"),
+    (("command injection", "os command injection"), "commix"),
+    (("padding oracle",), "padbuster"),
+    # These three have no apt package -- kali.org/tools/ (this project's
+    # only crawl source) never had a chance to find them, even though
+    # they're the real, standard tool for each technique. Added by hand
+    # 2026-08-31 with real (non-apt) install commands; see tool_graph.py.
+    (("jwt", "json web token"), "jwt_tool"),
+    (("deserialization", "deserialize"), "ysoserial"),
+    (("xxe", "xml external entity"), "xxeinjector"),
+    # CSRF and IDOR have no dedicated tool anywhere in the security tooling
+    # ecosystem, not just missing from this crawl -- a CSRF "exploit" is a
+    # hand-crafted auto-submitting form/request using the target's own field
+    # names, an IDOR "exploit" is just changing an ID in an otherwise-normal
+    # request. Originally mapped to burpsuite (a real, already-crawled tool)
+    # on the theory that both live as a *feature* of a general web proxy --
+    # wrong in practice: burpsuite has no headless CLI mode that does this,
+    # it's a GUI interception proxy, so mapping to it just swapped one
+    # irrelevant tool for a different unrunnable one. Switched 2026-09-01 to
+    # curl -- not a "tool" for this so much as direct HTTP request
+    # construction, which is what both techniques actually are.
+    (("csrf", "cross-site request forgery"), "curl"),
+    (("idor", "insecure direct object reference"), "curl"),
+]
+
+
+def _technique_tool_override(phase: dict, driver) -> str | None:
+    """ARGUS-SCANNER: Returns a verified tool name if the phase's own text
+    names an attack technique this project's tool graph has a real,
+    specific tool for -- confirmed present via a direct graph lookup
+    (not assumed from the override table alone, in case the graph node
+    was ever removed/renamed)."""
+    text = f"{phase.get('objective', '')} {phase.get('capability_needed', '')}".lower()
+    for keywords, tool_name in _TECHNIQUE_TOOL_OVERRIDES:
+        if any(k in text for k in keywords) and get_tool_by_name(driver, tool_name):
+            return tool_name
+    return None
 
 
 def _log_tool_unavailable(entry: str) -> None:
@@ -89,25 +147,49 @@ def _broaden_to_category(capability: str) -> str:
     return "network_tool"
 
 
-def _plan_attack_path(topology: dict, driver) -> dict:
-    """ARGUS-SCANNER: Red reasons over the full victim topology to plan its
-    attack path across containers before execution begins."""
+def _plan_attack_path(topology: dict, driver, vuln_context: dict) -> dict:
+    """
+    ARGUS-SCANNER: Red reasons over the full victim topology to plan its
+    attack path across containers before execution begins.
+
+    Takes vuln_context now -- found live 2026-08-29 reviewing a completed
+    WebGoat report: this previously took only `topology`, so the resulting
+    attack_phases were generic ("exploit a known vulnerability... to gain
+    unauthorized access") and near-identical across every single finding in
+    a scan, completely untethered from the specific vulnerability `analyze()`
+    was actually called for. Each phase now also carries an
+    `exploit_condition` -- a concrete, checkable description of what success
+    evidence would actually look like for THIS vulnerability (e.g. "stdout
+    contains the contents of a file outside the intended directory" for a
+    path traversal), used by _assess_objective() instead of a vague restated
+    objective.
+    """
     prompt = (
         "You are a red team attacker. You have identified the following "
         "target infrastructure:\n"
         f"{json.dumps(topology['services'])}\n\n"
         "Network connectivity:\n"
         f"{json.dumps(topology['network_map'])}\n\n"
-        "Plan your attack path:\n"
+        "You are specifically investigating this vulnerability:\n"
+        f"Type: {vuln_context.get('vuln_type', '?')} ({vuln_context.get('cwe', '?')})\n"
+        f"Location: {vuln_context.get('filepath', '?')} lines "
+        f"{vuln_context.get('line_start', '?')}-{vuln_context.get('line_end', '?')}\n"
+        f"Description: {vuln_context.get('description', '')}\n"
+        f"Attack vector: {vuln_context.get('attack_vector', '')}\n\n"
+        "Plan an attack path that actually exercises THIS vulnerability, not "
+        "a generic sweep of the topology:\n"
         "1. Which service do you attack first and why?\n"
-        "2. What is your objective on that service?\n"
+        "2. What is your objective on that service, specific to this vulnerability?\n"
         "3. If you gain access, which service do you pivot to next?\n"
-        "4. What is the end goal of the full attack chain?\n\n"
+        "4. What is the end goal of the full attack chain?\n"
+        "5. For each phase, what concrete evidence in the command output would "
+        "actually prove this specific objective was met (not just that a "
+        "command ran without error)?\n\n"
         "Return as JSON:\n"
         '{"entry_service": str, "entry_rationale": str, '
         '"pivot_sequence": [str], "end_goal": str, '
         '"attack_phases": [{"service": str, "objective": str, '
-        '"capability_needed": str}]}'
+        '"capability_needed": str, "exploit_condition": str}]}'
     )
     raw = _call_qwen(prompt, "scanner.scanner_red._plan_attack_path")
     return _parse_json(raw, {
@@ -135,14 +217,16 @@ def _deliver_tool(supervisor_url: str, container_name: str, tool_name: str,
 
 def _request_tool_for_phase(phase: dict, acquired_capabilities: dict,
                              supervisor_url: str, container_name: str,
-                             max_cycles: int = 3) -> dict:
+                             driver, max_cycles: int = 3) -> dict:
     """
     ARGUS-SCANNER: Requests a tool for the current attack phase.
     acquired_capabilities tracks capability -> tool_name across the whole
     scenario, not per-container -- a capability resolved on one service is
-    re-delivered to a new one via the cache, never re-requested. Falls
-    back through max_cycles of broadening, then substitution reasoning,
-    then marks the phase blocked. Never stops the scenario.
+    re-delivered to a new one via the cache, never re-requested. Checks
+    _technique_tool_override() first (a specific, verified tool for a
+    named attack technique) before falling back through max_cycles of
+    generic category broadening, then substitution reasoning, then marks
+    the phase blocked. Never stops the scenario.
     """
     capability = phase["capability_needed"]
 
@@ -150,6 +234,13 @@ def _request_tool_for_phase(phase: dict, acquired_capabilities: dict,
         known_tool = acquired_capabilities[capability]
         _deliver_tool(supervisor_url, container_name, known_tool, install_from_cache=True)
         return {"tool": known_tool, "status": "acquired",
+                "installed_tool_used": None, "log_entry": None}
+
+    override_tool = _technique_tool_override(phase, driver)
+    if override_tool:
+        _deliver_tool(supervisor_url, container_name, override_tool)
+        acquired_capabilities[capability] = override_tool
+        return {"tool": override_tool, "status": "acquired",
                 "installed_tool_used": None, "log_entry": None}
 
     broadening_terms = [
@@ -217,14 +308,25 @@ def _exec_in_container(supervisor_url: str, container_name: str, tool: str) -> s
         return f"EXEC_ERROR: {e}"
 
 
-def _assess_objective(objective: str, observations: dict,
-                       execution_stdout: str, driver) -> dict:
+def _assess_objective(objective: str, observations: dict, execution_stdout: str,
+                       driver, exploit_condition: str = "") -> dict:
     """
-    ARGUS-SCANNER: Assesses phase objective from two sources. Execution
-    stdout is ground truth; Qwen's read is a secondary signal that never
-    overrides real execution evidence -- if stdout has real content, the
-    phase is scored achieved even if Qwen's read disagreed (logged as a
-    conflict, not silently overridden).
+    ARGUS-SCANNER: Assesses phase objective from two sources.
+
+    Changed 2026-08-29 -- found live reviewing a completed WebGoat report:
+    the previous version treated "stdout is non-empty and doesn't contain a
+    hard-failure string" as ground truth that could never be overridden, even
+    by Qwen's own dissenting read -- logged as a "conflict" but the dissent
+    was discarded, not honored. That bar is trivial to clear (any tool that
+    runs at all clears it) and it fired on 53% of phases in that report,
+    including one where the tool that ran was a *code editor* against a
+    Dockerfile-permissions objective -- "achieved" purely because it printed
+    something. `exploit_condition` (from _plan_attack_path(), now grounded in
+    the actual vulnerability) lets Qwen judge something falsifiable instead
+    of a vague restated objective. Both signals must now agree for
+    `achieved`: a non-empty stdout is necessary (rules out a call that
+    produced nothing) but no longer sufficient on its own -- a disagreement
+    is scored not-achieved and logged as a conflict, not silently overruled.
     """
     stdout_low = execution_stdout.lower()
     execution_success = bool(execution_stdout.strip()) and not any(
@@ -232,24 +334,25 @@ def _assess_objective(objective: str, observations: dict,
 
     prompt = (
         f"Phase objective: {objective}\n"
-        f"Observations: {json.dumps(observations)}\n"
-        "Did the attacker achieve the objective?\n"
-        'Return ONLY: {"achieved": true} or {"achieved": false}'
+        + (f"Concrete success condition: {exploit_condition}\n" if exploit_condition else "")
+        + f"Observations: {json.dumps(observations)}\n"
+        f"Raw command output:\n{execution_stdout[:2000]}\n\n"
+        + ("Does the raw command output actually satisfy the concrete success "
+           "condition above -- not just \"did a command run\"?\n"
+           if exploit_condition else
+           "Did the attacker achieve the objective, based on real evidence in "
+           "the output, not just the absence of an error?\n")
+        + 'Return ONLY: {"achieved": true} or {"achieved": false}'
     )
     raw = _call_qwen(prompt, "scanner.scanner_red._assess_objective")
     qwen_result = _parse_json(raw, {"achieved": False})
     qwen_achieved = bool(qwen_result.get("achieved"))
 
-    conflict = False
-    if not execution_success:
-        achieved = False
-    elif qwen_achieved:
-        achieved = True
-    else:
-        achieved = True  # execution wins -- stdout had real content
-        conflict = True
-        print(f"[ScannerRed] OBJECTIVE_SIGNAL_CONFLICT | Qwen said not "
-              f"achieved but execution produced output | phase: {objective}",
+    achieved = execution_success and qwen_achieved
+    conflict = execution_success != qwen_achieved
+    if conflict:
+        print(f"[ScannerRed] OBJECTIVE_SIGNAL_CONFLICT | execution={execution_success} "
+              f"qwen={qwen_achieved} -> scored not-achieved | phase: {objective}",
               flush=True)
 
     return {"achieved": achieved, "execution_evidence": execution_success,
@@ -275,7 +378,8 @@ def _argus_lookup(terms: list, driver) -> list:
 
 
 def analyze(vuln_context: dict, topology: dict, driver, sandbox: bool = False,
-            supervisor_url: str = "http://localhost:8000") -> dict:
+            supervisor_url: str = "http://localhost:8000",
+            known_credentials: dict | None = None) -> dict:
     """ARGUS-SCANNER: Full red analysis for one VulnContext. Default
     supervisor_url uses localhost, not the spec's Docker-internal
     "gr-supervisor" hostname -- see run_scenario.py's SUPERVISOR_URL
@@ -287,7 +391,7 @@ def analyze(vuln_context: dict, topology: dict, driver, sandbox: bool = False,
     matched_cve_id = next(
         (m["node_id"] for m in matched if m["node_type"] == "vulnerability"), "")
 
-    attack_plan = _plan_attack_path(topology, driver) if sandbox else {
+    attack_plan = _plan_attack_path(topology, driver, vuln_context) if sandbox else {
         "entry_service": "", "entry_rationale": "", "pivot_sequence": [],
         "end_goal": "", "attack_phases": [],
     }
@@ -316,7 +420,9 @@ def analyze(vuln_context: dict, topology: dict, driver, sandbox: bool = False,
                              "phases": [], "kill_chain_complete": False,
                              "final_service_reached": ""}
     else:
-        execution_result = _execute_attack_plan(attack_plan, topology, supervisor_url, driver)
+        execution_result = _execute_attack_plan(
+            attack_plan, topology, supervisor_url, driver, vuln_context,
+            credentials=known_credentials)
 
     return {
         "vuln_context": vuln_context,
@@ -330,58 +436,385 @@ def analyze(vuln_context: dict, topology: dict, driver, sandbox: bool = False,
     }
 
 
+def _container_port(topology: dict, service_name: str) -> str:
+    """ARGUS-SCANNER: Extracts the container-internal listening port for a
+    topology service from its compose 'ports' strings (e.g. "8080:8080" ->
+    "8080", bare "8080" -> "8080"). The attacker container reaches the
+    victim over their shared Docker network via Compose's own service-name
+    DNS alias, so it's the CONTAINER side of the mapping that matters --
+    there's no host-port NAT to go through at all on a container-to-
+    container hop. Defaults to "80" if nothing parses, same as a generic
+    unconfigured web service would use."""
+    for svc in topology.get("services", []):
+        if svc.get("name") != service_name:
+            continue
+        for p in svc.get("ports", []):
+            m = re.search(r":(\d+)(?:/\w+)?$", p)
+            if m:
+                return m.group(1)
+            m = re.match(r"^(\d+)(?:/\w+)?$", p.strip())
+            if m:
+                return m.group(1)
+        break
+    return "80"
+
+
+def _spawn_attacker(supervisor_url: str, target_services: list) -> str | None:
+    """ARGUS-SCANNER: Asks the supervisor to spin up a real attacker
+    container connected to every target service's Docker network(s) -- see
+    supervisor.py's spawn_attacker_container() for why this replaced
+    exec'ing tools directly inside the victim's own container."""
+    if not target_services:
+        return None
+    try:
+        resp = requests.post(
+            f"{supervisor_url}/spawn_attacker",
+            json={"targets": target_services, "run_id": uuid.uuid4().hex[:8]},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json().get("attacker_container")
+    except requests.RequestException:
+        return None
+
+
+def _teardown_attacker(supervisor_url: str, attacker_container: str | None) -> None:
+    """ARGUS-SCANNER: Tears down the per-cluster attacker container. Best
+    effort -- a failed teardown leaks one throwaway container, not a
+    correctness issue for the scan itself, so exceptions are swallowed
+    rather than propagated."""
+    if not attacker_container:
+        return
+    try:
+        requests.post(f"{supervisor_url}/teardown_one",
+                      json={"container": attacker_container}, timeout=30)
+    except requests.RequestException:
+        pass
+
+
+def _build_invocation(tool_name: str, phase: dict, vuln_context: dict,
+                       target_url: str, driver, cookie_jar: str = "",
+                       path_hints: tuple = ()) -> str:
+    """ARGUS-SCANNER: Builds the actual shell command to run in the attacker
+    container.
+
+    Added 2026-09-01, replacing a bare tool-name invocation -- found live
+    investigating why every phase that acquired a real, correctly-mapped
+    tool (post the 2026-08-31 tool-mapping fix) still scored not-achieved:
+    `_exec_in_container` ran the tool by name alone (`sh -c sqlmap`, `sh -c
+    jwt_tool`), which just prints that tool's own usage banner and exits --
+    non-empty stdout, no hard-failure marker, so execution_success=True, but
+    nothing was ever actually attempted against the target. The tool's own
+    usage_pattern (stored once on its graph node, reused for every finding
+    that tool is ever picked for -- not per-run, not part of tool
+    selection) plus this specific finding's code/description let Qwen
+    construct a real, armed command instead of guessing CLI syntax from
+    scratch every time.
+
+    cookie_jar (added same day, once _authenticate() proved a real login
+    was achievable against a source-matched container) points at a
+    already-populated curl cookie file inside the attacker container --
+    most lesson/app endpoints require an authenticated session, so a
+    command that doesn't attach it would hit an auth wall regardless of
+    how correct the rest of the exploit is.
+
+    path_hints (added same day) are real base-path candidates from
+    topology's repo_name and/or _discover_routes -- given to Qwen as real
+    signal alongside the code/description it was already inferring a
+    route from blind, since a source snippet alone doesn't reveal an
+    app's context path (WebGoat's /WebGoat prefix, confirmed live, is
+    invisible in the vulnerable method's own code)."""
+    tool_node = get_tool_by_name(driver, tool_name)
+    usage_pattern = (tool_node or {}).get("properties", {}).get("usage_pattern", "")
+    session_note = (
+        f"\nAn authenticated session is available in this container as a "
+        f"curl cookie jar at {cookie_jar} -- attach it with `-b {cookie_jar}` "
+        f"(and `-c {cookie_jar}` if the tool needs to persist cookies back) "
+        f"so the request reaches protected endpoints, not just public ones.\n"
+        if cookie_jar else ""
+    )
+    hints_note = (
+        f"\nReal base paths this application actually serves (from live "
+        f"discovery, not a guess): {', '.join(path_hints)} -- the "
+        f"vulnerable endpoint is very likely under one of these, not at "
+        f"the target's bare root.\n"
+        if path_hints else ""
+    )
+    prompt = (
+        f"Tool: {tool_name}\n"
+        f"How this tool is invoked: "
+        f"{usage_pattern or '(no usage pattern on file -- use your own knowledge of this tool)'}\n"
+        f"{session_note}"
+        f"{hints_note}\n"
+        f"Vulnerability type: {vuln_context.get('vuln_type', '?')} ({vuln_context.get('cwe', '?')})\n"
+        f"Vulnerable code:\n{vuln_context.get('code_block', '')}\n"
+        f"Description: {vuln_context.get('description', '')}\n"
+        f"Attack vector: {vuln_context.get('attack_vector', '')}\n"
+        f"Phase objective: {phase.get('objective', '')}\n"
+        f"Target base URL (reachable from this attacker container over the "
+        f"real Docker network): {target_url}\n\n"
+        "Infer the real HTTP endpoint path from the code/description (a "
+        "route annotation, a filename convention, or the description's own "
+        "wording) and construct ONE real shell command that actually "
+        "exercises this vulnerability using this tool against this target "
+        "-- a fully-armed command with real flags, the real target URL, and "
+        "a real payload, not a bare tool name. You may chain multiple "
+        "commands with && or $() in one string if the tool needs a "
+        "separate delivery step (e.g. ysoserial only generates a payload; "
+        "it must then be POSTed with curl).\n\n"
+        "If the attack needs a value that only exists on the live target "
+        "(a session token, a cookie, a CSRF token, an ID) and isn't given "
+        "to you above, the command must actually CAPTURE it first with a "
+        "real request chained via shell variable substitution -- e.g. "
+        "`TOKEN=$(curl -s ... | grep -oP '...') && jwt_tool $TOKEN ...` -- "
+        "never write a bracketed placeholder like <captured_token> or "
+        "<cracked_secret> into the final command; the shell will try to "
+        "execute that literally and it will fail immediately (`<x` is "
+        "input redirection, not a value to fill in later).\n"
+        'Return ONLY: {"command": str}'
+    )
+    raw = _call_qwen(prompt, "scanner.scanner_red._build_invocation")
+    result = _parse_json(raw, {"command": tool_name})
+    return result.get("command") or tool_name
+
+
+_CREDENTIAL_FINDING_MARKERS = (
+    "hardcoded credential", "default credential", "hardcoded password",
+    "default password", "hardcoded user", "hardcoded secret",
+)
+
+
+def _find_hardcoded_credentials(vuln_contexts: list, driver) -> dict:
+    """ARGUS-SCANNER: Scans every finding in the scan (not just the current
+    cluster) for a hardcoded/default-credentials finding and extracts a
+    real username/password pair from its code_block -- reused as the login
+    for every phase's exploitation across the whole scenario. Runs once
+    per scan, not per cluster (credentials don't change per finding).
+
+    A genuinely detected credential-exposure finding becomes the key that
+    unlocks testing every other authenticated endpoint, rather than
+    treating auth as a separate blocker each cluster would otherwise hit
+    independently. Only reliable once the victim container actually
+    matches the analyzed source (see victim_builder.py's
+    _try_build_from_dockerfile, added the same day this was -- a
+    version-mismatched container can flag a real hardcoded-credentials
+    finding whose exact literal values were never true for whatever
+    happens to be running)."""
+    candidates = [
+        vc for vc in vuln_contexts
+        if vc.get("cwe", "") == "CWE-798"
+        or any(marker in vc.get("vuln_type", "").lower()
+               for marker in _CREDENTIAL_FINDING_MARKERS)
+    ]
+    for vc in candidates:
+        prompt = (
+            "The following code contains hardcoded or default credentials:\n"
+            f"{vc.get('code_block', '')}\n\n"
+            f"Description: {vc.get('description', '')}\n\n"
+            "Extract the actual literal username and password STRING "
+            "VALUES (not variable names). If no real login credential pair "
+            "is extractable from this snippet, return empty strings.\n"
+            'Return ONLY: {"username": str, "password": str}'
+        )
+        raw = _call_qwen(prompt, "scanner.scanner_red._find_hardcoded_credentials")
+        result = _parse_json(raw, {"username": "", "password": ""})
+        if result.get("username") and result.get("password"):
+            return {"username": result["username"], "password": result["password"]}
+    return {}
+
+
+_LOGIN_PATHS = ("/login", "/signin", "/sign_in", "/auth/login", "/account/login", "/user/login")
+
+
+def _discover_routes(supervisor_url: str, attacker_container: str, target_url: str) -> list[str]:
+    """ARGUS-SCANNER: Real, general route discovery -- runs dirb (a
+    content-discovery brute-forcer, not guessed CLI syntax: delivered via
+    the normal tool graph) from the attacker container against the live
+    target, so both _authenticate() and _build_invocation() can work from
+    routes the app actually serves instead of inferring blind from a
+    source snippet or a fixed guess list.
+
+    Added 2026-09-01 as the general fallback for apps whose base path
+    doesn't match their own project name (the cheaper signal
+    _execute_attack_plan tries first, from topology's repo_name) -- e.g.
+    WebGoat's own dirb wordlist has no entry for "webgoat" at all
+    (confirmed live via a direct grep), so blind brute-force alone
+    wouldn't have found /WebGoat either; the two signals are
+    complementary, not redundant. Bounded to dirb's small.txt wordlist
+    and a short timeout -- this runs once per scenario, not once per
+    phase, so it doesn't need to be exhaustive, just fast enough not to
+    dominate the scenario's wall-clock budget."""
+    _deliver_tool(supervisor_url, attacker_container,
+                  "which dirb || (apt-get update -qq && apt-get install -y -qq dirb)")
+    cmd = (f"dirb {target_url} /usr/share/dirb/wordlists/small.txt "
+           f"-r -S -w 2>&1 | head -100")
+    output = _exec_in_container(supervisor_url, attacker_container, cmd)
+    return re.findall(r"^\+\s+\S+?(/\S*)\s+\(CODE:", output, re.MULTILINE)
+
+
+def _authenticate(supervisor_url: str, attacker_container: str,
+                   target_url: str, credentials: dict,
+                   path_hints: tuple = ()) -> str:
+    """ARGUS-SCANNER: One-time-per-scenario login from the attacker
+    container against the real target over the Docker network, using
+    whatever credential pair _find_hardcoded_credentials extracted.
+    Returns a cookie-jar path inside the attacker container (usable by
+    later curl-based invocations via `-b <path>`) on success, or "" if
+    every attempt fails -- a phase still gets tried unauthenticated in
+    that case rather than being blocked outright.
+
+    Tries a handful of common login paths and the two most common form
+    field-name conventions (username/password, email/password) rather
+    than assuming one framework's exact form -- general-purpose, not
+    tuned to any specific app. Success is judged by the POST's redirect
+    NOT going back to a path containing "error" or "login" a second time
+    (confirmed live 2026-09-01 against a real, source-matched WebGoat
+    container: a failed login redirects to .../login?error, a real one
+    redirects to .../welcome.mvc).
+
+    path_hints (added same day) are real base-path candidates from
+    topology's repo_name and/or _discover_routes -- tried as a prefix on
+    every login path before falling back to bare paths, since many
+    self-hosted apps mount everything under their own project name as a
+    context path (WebGoat's real login is /WebGoat/login, invisible to
+    the bare-path list alone -- found live investigating exactly this)."""
+    if not credentials.get("username"):
+        return ""
+    cookie_jar = "/tmp/argus_session.txt"
+    prefixes = list(path_hints) + [""]
+    login_candidates = [f"{prefix}{path}" for prefix in prefixes for path in _LOGIN_PATHS]
+    for path in login_candidates:
+        page = _exec_in_container(
+            supervisor_url, attacker_container,
+            f"curl -s -c {cookie_jar} -m 10 {target_url}{path}")
+        if not page.strip():
+            continue
+        username = credentials["username"]
+        password = credentials["password"]
+        for user_field in ("username", "email", "user"):
+            login_cmd = (
+                f"curl -sD - -b {cookie_jar} -c {cookie_jar} -m 10 -o /dev/null "
+                f"-X POST {target_url}{path} "
+                f"-d '{user_field}={username}&password={password}'"
+            )
+            headers = _exec_in_container(supervisor_url, attacker_container, login_cmd)
+            m = re.search(r"Location:\s*(\S+)", headers)
+            if "30" in headers.split("\n", 1)[0] and m:
+                location = m.group(1).lower()
+                if "error" not in location and not location.rstrip("/").endswith(path):
+                    return cookie_jar
+    return ""
+
+
 def _execute_attack_plan(attack_plan: dict, topology: dict,
-                          supervisor_url: str, driver) -> dict:
+                          supervisor_url: str, driver, vuln_context: dict,
+                          credentials: dict | None = None) -> dict:
     """ARGUS-SCANNER: Runs every phase in attack_plan, tracking acquired
     capabilities across the whole scenario. A blocked phase is skipped,
     never stops the scenario; only exhausting every phase (blocked or not)
-    ends it."""
+    ends it.
+
+    Changed 2026-09-01: tools now run inside a real, separate attacker
+    container (one per cluster, spawned before the phase loop and torn
+    down after it in a finally block) connected to the target services'
+    own Docker network(s), instead of being delivered into and exec'd
+    inside the victim's own app container. `container_name` below still
+    means the victim service -- it's still what phases target and how the
+    real port/URL gets resolved -- but tool delivery and execution now go
+    to `attacker_container` instead."""
     acquired_capabilities = {}
     phase_results = []
     all_blocked = True
     service_by_name = {s["name"]: s for s in topology["services"]}
     phases = attack_plan.get("attack_phases", [])
 
-    for phase in phases:
-        container_name = phase.get("service", "")
-        if container_name not in service_by_name:
+    # Docker container lookup needs the real container_id/full name -- the
+    # bare compose service name ("webgoat") is only a network DNS alias,
+    # not something `docker_client.containers.get()` resolves (confirmed
+    # live 2026-09-01: raises NotFound). topology's container_id (from
+    # `docker compose ps`, victim_builder.py:370) is the real one.
+    target_container_ids = list({
+        service_by_name[p["service"]]["container_id"] for p in phases
+        if p.get("service", "") in service_by_name
+        and service_by_name[p["service"]].get("container_id")
+    })
+    attacker_container = _spawn_attacker(supervisor_url, target_container_ids)
+
+    cookie_jar = ""
+    path_hints: list[str] = []
+    repo_name = topology.get("repo_name", "")
+    if repo_name:
+        path_hints.append(f"/{repo_name}")
+
+    if attacker_container and credentials and credentials.get("username") and phases:
+        first_service = next((p["service"] for p in phases
+                               if p.get("service", "") in service_by_name), None)
+        if first_service:
+            auth_port = _container_port(topology, first_service)
+            target_url = f"http://{first_service}:{auth_port}"
+            cookie_jar = _authenticate(
+                supervisor_url, attacker_container, target_url, credentials,
+                path_hints=tuple(path_hints))
+            if not cookie_jar:
+                # The cheap repo-name guess didn't pan out -- fall back to
+                # real, general route discovery (dirb) rather than giving
+                # up on authentication entirely.
+                discovered = _discover_routes(supervisor_url, attacker_container, target_url)
+                if discovered:
+                    path_hints.extend(p for p in discovered if p not in path_hints)
+                    cookie_jar = _authenticate(
+                        supervisor_url, attacker_container, target_url, credentials,
+                        path_hints=tuple(path_hints))
+
+    try:
+        for phase in phases:
+            container_name = phase.get("service", "")
+            if container_name not in service_by_name or not attacker_container:
+                phase_results.append({
+                    "service": container_name, "tool": None, "status": "blocked",
+                    "result": "skipped", "execution_evidence": False,
+                    "qwen_signal": False, "conflict": False,
+                    "observations": {}, "pivoted": False,
+                })
+                continue
+
+            tool_result = _request_tool_for_phase(
+                phase, acquired_capabilities, supervisor_url, attacker_container, driver)
+
+            if tool_result["status"] == "blocked":
+                phase_results.append({
+                    "service": container_name, "tool": None, "status": "blocked",
+                    "result": "skipped", "execution_evidence": False,
+                    "qwen_signal": False, "conflict": False,
+                    "observations": {}, "pivoted": False,
+                })
+                continue
+
+            active_tool = (tool_result["tool"] if tool_result["status"] == "acquired"
+                           else tool_result["installed_tool_used"])
+            port = _container_port(topology, container_name)
+            target_url = f"http://{container_name}:{port}"
+            command = _build_invocation(active_tool, phase, vuln_context, target_url,
+                                         driver, cookie_jar=cookie_jar,
+                                         path_hints=tuple(path_hints))
+            stdout = _exec_in_container(supervisor_url, attacker_container, command)
+            obs = normalize(stdout, phase.get("technique_id", ""), driver)
+            assessment = _assess_objective(phase.get("objective", ""), obs, stdout, driver,
+                                            exploit_condition=phase.get("exploit_condition", ""))
+
+            all_blocked = False
             phase_results.append({
-                "service": container_name, "tool": None, "status": "blocked",
-                "result": "skipped", "execution_evidence": False,
-                "qwen_signal": False, "conflict": False,
-                "observations": {}, "pivoted": False,
+                "service": container_name, "tool": active_tool,
+                "status": tool_result["status"],
+                "result": "success" if assessment["achieved"] else "partial",
+                "execution_evidence": assessment["execution_evidence"],
+                "qwen_signal": assessment["qwen_signal"],
+                "conflict": assessment["conflict"],
+                "observations": obs,
+                "pivoted": assessment["achieved"] and phase is not phases[-1],
             })
-            continue
-
-        tool_result = _request_tool_for_phase(
-            phase, acquired_capabilities, supervisor_url, container_name)
-
-        if tool_result["status"] == "blocked":
-            phase_results.append({
-                "service": container_name, "tool": None, "status": "blocked",
-                "result": "skipped", "execution_evidence": False,
-                "qwen_signal": False, "conflict": False,
-                "observations": {}, "pivoted": False,
-            })
-            continue
-
-        active_tool = (tool_result["tool"] if tool_result["status"] == "acquired"
-                       else tool_result["installed_tool_used"])
-        stdout = _exec_in_container(supervisor_url, container_name, active_tool)
-        obs = normalize(stdout, phase.get("technique_id", ""), driver)
-        assessment = _assess_objective(phase.get("objective", ""), obs, stdout, driver)
-
-        all_blocked = False
-        phase_results.append({
-            "service": container_name, "tool": active_tool,
-            "status": tool_result["status"],
-            "result": "success" if assessment["achieved"] else "partial",
-            "execution_evidence": assessment["execution_evidence"],
-            "qwen_signal": assessment["qwen_signal"],
-            "conflict": assessment["conflict"],
-            "observations": obs,
-            "pivoted": assessment["achieved"] and phase is not phases[-1],
-        })
+    finally:
+        _teardown_attacker(supervisor_url, attacker_container)
 
     kill_chain_complete = bool(
         not all_blocked and phase_results and phases and

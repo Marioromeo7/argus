@@ -1043,6 +1043,60 @@ def deliver_tool(container_name: str, install_command: str) -> bool:
         return False
 
 
+def spawn_attacker_container(target_containers: list, run_suffix: str) -> str | None:
+    """ARGUS-SCANNER: Spins up a fresh graphrange-red attacker container and
+    connects it to every Docker network any of target_containers is on, so
+    it can reach them by their real compose service-name DNS alias (Compose
+    auto-registers each service's name as a network alias on its project
+    network) -- mirrors spawn_scenario()'s shared-network red+victim model,
+    but for the Scanner's arbitrarily-discovered target repo containers
+    instead of a fixed CPE-resolved victim image.
+
+    Added 2026-09-01: the Scanner previously had no attacker container at
+    all -- scanner_red.py delivered tools straight into the target repo's
+    own app container and exec'd them there, attacking itself via
+    localhost. That both mutated the container under test (installing
+    sqlmap etc. into it) and made it impossible to build a real target URL
+    (no network hop, no DNS name needed -- "localhost" tells you nothing
+    about which service or port). A real sibling container fixes both."""
+    networks: set[str] = set()
+    for ref in target_containers:
+        try:
+            c = docker_client.containers.get(ref)
+        except docker.errors.NotFound:
+            continue
+        networks.update(c.attrs.get("NetworkSettings", {}).get("Networks", {}).keys())
+    if not networks:
+        return None
+    network_list = list(networks)
+    name = f"gr-scan-red-{run_suffix}"
+    try:
+        attacker = docker_client.containers.run(
+            RED_IMAGE, name=name, network=network_list[0],
+            detach=True, remove=False, init=True,
+        )
+        for net_name in network_list[1:]:
+            docker_client.networks.get(net_name).connect(attacker)
+        return attacker.name
+    except docker.errors.APIError:
+        return None
+
+
+def teardown_one(container_name: str) -> bool:
+    """ARGUS-SCANNER: Stops+removes a single named container, ignoring
+    NotFound -- spawn_scenario's all-or-nothing red+blue+victim teardown
+    expects all three IDs together, which doesn't fit the Scanner's
+    one-attacker-per-cluster lifecycle (spawned and torn down once per
+    (vuln_type, cwe) cluster, independent of any victim/blue container)."""
+    try:
+        c = docker_client.containers.get(container_name)
+        c.stop(timeout=5)
+        c.remove()
+        return True
+    except docker.errors.NotFound:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # 3. spawn_scenario
 # ---------------------------------------------------------------------------
@@ -1238,6 +1292,20 @@ def http_exec():
 def http_spawn_scenario():
     scenario = request.get_json(force=True)
     return jsonify(spawn_scenario(scenario))
+
+
+@app.route("/spawn_attacker", methods=["POST"])
+def http_spawn_attacker():
+    body = request.get_json(force=True)
+    name = spawn_attacker_container(body.get("targets", []), body.get("run_id", "adhoc"))
+    return jsonify({"attacker_container": name})
+
+
+@app.route("/teardown_one", methods=["POST"])
+def http_teardown_one():
+    body = request.get_json(force=True)
+    ok = teardown_one(body["container"])
+    return jsonify({"success": ok})
 
 
 @app.route("/teardown", methods=["POST"])

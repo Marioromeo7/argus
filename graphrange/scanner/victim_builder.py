@@ -44,6 +44,38 @@ UNSAFE_FLAGS = [
 ]
 ALLOWED_REGISTRIES = {"docker.io", "ghcr.io", "gcr.io", "public.ecr.aws"}
 
+# ARGUS-SCANNER: per-ecosystem pre-build step, used only as a *retry* after
+# a plain `docker build .` from the repo's own Dockerfile fails -- see
+# _try_build_from_dockerfile()'s docstring for why this exists at all.
+# Builder image + command only; the repo is bind-mounted read-write so
+# build output (target/, dist/, build/) lands where the Dockerfile's own
+# COPY expects it. Ecosystems whose Dockerfiles are typically already
+# self-contained (python, ruby_rails, php_laravel, dotnet) are absent on
+# purpose -- they get exactly one `docker build .` attempt and then the
+# existing manifest+Qwen-inference fallback, not a guessed build step that
+# would just as likely be wrong.
+_SOURCE_BUILD_MAP = {
+    "java_maven": ("maven:3.9-eclipse-temurin-21", "mvn package -DskipTests -q"),
+    "java_gradle": ("gradle:8-jdk21", "gradle build -x test"),
+    "node": ("node:22", "sh -c 'npm install && npm run build --if-present'"),
+    "go": ("golang:1.22", "go build -o /repo/app ./..."),
+    "rust": ("rust:1.79", "cargo build --release"),
+}
+
+# ARGUS-SCANNER: persistent named volumes for each ecosystem's dependency
+# cache -- without this, every _prebuild_from_source() call (including a
+# retry after a transient network blip, or a re-run against the same repo
+# later) re-downloads the entire dependency tree from zero. Named volumes
+# survive across containers/runs (unlike a bind mount to a temp dir this
+# process would have to manage and clean up itself).
+_CACHE_MOUNT_MAP = {
+    "java_maven": ("argus-maven-cache", "/root/.m2"),
+    "java_gradle": ("argus-gradle-cache", "/root/.gradle"),
+    "node": ("argus-npm-cache", "/root/.npm"),
+    "go": ("argus-go-cache", "/root/go/pkg/mod"),
+    "rust": ("argus-cargo-cache", "/usr/local/cargo/registry"),
+}
+
 
 def _log(msg: str) -> None:
     print(f"[VictimBuilder] {msg}", flush=True)
@@ -390,7 +422,19 @@ def _parse_topology(compose_path: str) -> dict:
                  and set(s["networks"]) & set(svc["networks"])]
         network_map[svc["name"]] = peers
 
-    return {"compose_file": compose_path, "services": services, "network_map": network_map}
+    # The staging directory's basename preserves the repo's real, correctly-
+    # cased name (repo_intake.py names it "{repo_name}_{timestamp}" straight
+    # from the clone URL/path, before anything downstream lowercases it for
+    # Docker-safe service naming) -- a strong, nearly-free signal for
+    # self-branded apps that mount themselves under their own project name
+    # as a context path (WebGoat -> /WebGoat being the exact real-world
+    # case this was added for, 2026-09-01). Stripped of the trailing
+    # "_<timestamp>" repo_intake.py always appends.
+    repo_dir_name = os.path.basename(os.path.dirname(os.path.abspath(compose_path)))
+    repo_name = re.sub(r"_\d+$", "", repo_dir_name)
+
+    return {"compose_file": compose_path, "services": services,
+            "network_map": network_map, "repo_name": repo_name}
 
 
 def _scan_manifests(repo_path: str) -> dict:
@@ -421,6 +465,195 @@ def _scan_manifests(repo_path: str) -> dict:
     return manifest_map
 
 
+def _dockerfile_exposed_ports(dockerfile_path: str) -> list[str]:
+    """ARGUS-SCANNER: Pure regex extraction of EXPOSE directives -- zero-GPU,
+    deterministic, used to wire up the minimal compose file that wraps an
+    image built from the repo's own Dockerfile (see
+    _try_build_from_dockerfile)."""
+    try:
+        text = Path(dockerfile_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    ports = []
+    for m in re.finditer(r"^\s*EXPOSE\s+(.+)$", text, re.IGNORECASE | re.MULTILINE):
+        for tok in m.group(1).split():
+            port = re.match(r"^(\d+)", tok)
+            if port:
+                ports.append(port.group(1))
+    return ports
+
+
+_JAVA_VERSION_PATTERNS = (
+    r"<java\.version>\s*(\d+)\s*</java\.version>",
+    r"<maven\.compiler\.release>\s*(\d+)\s*</maven\.compiler\.release>",
+    r"<maven\.compiler\.target>\s*(\d+)\s*</maven\.compiler\.target>",
+    r"sourceCompatibility\s*=?\s*['\"]?(?:JavaVersion\.VERSION_)?(\d+)",
+    r"languageVersion\s*=\s*JavaLanguageVersion\.of\((\d+)\)",
+)
+
+
+def _detect_java_version(manifest_content: str) -> str:
+    """ARGUS-SCANNER: Extracts the JDK version a Maven/Gradle project
+    actually requires straight from its own manifest (pom.xml's
+    <java.version>/<maven.compiler.release>, or Gradle's
+    sourceCompatibility/toolchain) -- zero-GPU, deterministic.
+
+    Found live 2026-09-01: a fixed builder tag (`maven:3.9-eclipse-
+    temurin-21`) is not general -- it broke on the very first real repo
+    tried (WebGoat's pom.xml declares <java.version>25</java.version>,
+    Maven's compiler plugin then fails outright with "release version 25
+    not supported" against a JDK 21 builder). Any project pinned to a
+    different JDK than whatever this project happened to hardcode would
+    hit the exact same failure -- detecting the real requirement per-repo
+    is the only way this generalizes. Defaults to "21" (a current, widely
+    available LTS) only when no version marker is found at all."""
+    for pattern in _JAVA_VERSION_PATTERNS:
+        m = re.search(pattern, manifest_content)
+        if m:
+            return m.group(1)
+    return "21"
+
+
+def _prebuild_from_source(repo_path: str, ecosystem: str, manifest_content: str = "") -> bool:
+    """ARGUS-SCANNER: Runs the detected ecosystem's standard build command
+    in a throwaway builder container with the repo bind-mounted, so a
+    Dockerfile that expects a pre-built artifact (a jar under target/, a
+    dist/ folder, a compiled binary) has one to COPY when the real `docker
+    build` is retried. Only called as a retry after a first `docker build
+    .` attempt fails -- see _try_build_from_dockerfile().
+
+    For the two Java ecosystems, the builder image's JDK version is
+    resolved from the project's own manifest (_detect_java_version)
+    rather than fixed -- see that function's docstring for why a fixed
+    tag isn't general enough."""
+    if ecosystem not in _SOURCE_BUILD_MAP:
+        return False
+    builder_image, build_command = _SOURCE_BUILD_MAP[ecosystem]
+    if ecosystem in ("java_maven", "java_gradle") and manifest_content:
+        java_version = _detect_java_version(manifest_content)
+        base_tool = "maven:3.9" if ecosystem == "java_maven" else "gradle:8"
+        builder_image = f"{base_tool}-eclipse-temurin-{java_version}"
+    try:
+        pull = subprocess.run(["docker", "pull", builder_image],
+                               capture_output=True, text=True, timeout=300)
+        if pull.returncode != 0 and ecosystem in ("java_maven", "java_gradle"):
+            # The version-specific tag doesn't exist on Docker Hub for
+            # this particular JDK release -- fall back to the map's
+            # original fixed tag rather than failing outright on a pull
+            # miss alone (a real compile failure against it still falls
+            # through to the existing manifest+Qwen-inference path).
+            _log(f"builder image {builder_image} not found -- "
+                 f"falling back to {_SOURCE_BUILD_MAP[ecosystem][0]}")
+            builder_image = _SOURCE_BUILD_MAP[ecosystem][0]
+            subprocess.run(["docker", "pull", builder_image],
+                            capture_output=True, text=True, timeout=300)
+        run_args = ["docker", "run", "--rm", "-v", f"{repo_path}:/repo", "-w", "/repo"]
+        if ecosystem in _CACHE_MOUNT_MAP:
+            volume_name, cache_path = _CACHE_MOUNT_MAP[ecosystem]
+            run_args += ["-v", f"{volume_name}:{cache_path}"]
+        run_args += [builder_image, "sh", "-c", build_command]
+        result = subprocess.run(
+            run_args, capture_output=True, text=True, timeout=900,
+        )
+        if result.returncode != 0:
+            # Maven/Gradle write almost everything, including the actual
+            # failure reason, to stdout -- stderr alone (the original
+            # version of this log line) came back empty on a real compile
+            # failure, hiding the real error entirely.
+            _log(f"source pre-build failed ({ecosystem}, {builder_image}): "
+                 f"{(result.stdout + result.stderr)[-800:]}")
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError) as e:
+        _log(f"source pre-build error ({ecosystem}): {e}")
+        return False
+
+
+def _try_build_from_dockerfile(repo_path: str) -> str | None:
+    """
+    ARGUS-SCANNER: Builds an image straight from the repo's own Dockerfile
+    -- the only path in this module that guarantees the dynamic-analysis
+    container matches the exact commit Pass 1/2 statically analyzed,
+    rather than whatever released version a public image tag happens to
+    be pinned to.
+
+    Found live 2026-09-01 on a real WebGoat run: the existing manifest+
+    Qwen-inference fallback picked the README's documented `webgoat/webgoat`
+    image (a reasonable inference -- see _extract_docker_hints), but that
+    image was version 24.04 (built 2025-03-11) while the statically
+    analyzed checkout was a commit from 2026-08-14 -- over a year newer.
+    Every dynamic-verification result for that scan was checked against
+    code that didn't necessarily match what was flagged. This isn't
+    WebGoat-specific: any repo without its own docker-compose.yml (most
+    repos) falls into the same manifest-inference path and the same risk.
+
+    Tries a direct `docker build .` first -- many Dockerfiles (especially
+    for interpreted languages) are fully self-contained and this just
+    works. Only on failure does it detect the ecosystem and run a real
+    pre-build step (_prebuild_from_source) before retrying once -- this
+    mirrors the exact gap _extract_docker_hints's own docstring already
+    named ("trying to docker build from the repo's own Dockerfile without
+    ever running the Maven build it needs") rather than guessing a fix
+    for it. Returns the built image tag, or None if both attempts fail --
+    the caller falls back to the existing manifest+Qwen-inference path
+    unchanged, so a source build failure never blocks a scan."""
+    dockerfile_path = os.path.join(repo_path, "Dockerfile")
+    if not os.path.exists(dockerfile_path):
+        return None
+
+    tag = f"argus-victim-{re.sub(r'[^a-z0-9]+', '-', os.path.basename(repo_path).lower())}"
+
+    def _build() -> bool:
+        result = subprocess.run(
+            ["docker", "build", "-t", tag, repo_path],
+            capture_output=True, text=True, timeout=1200,
+        )
+        if result.returncode != 0:
+            _log(f"docker build . failed: {(result.stdout + result.stderr)[-800:]}")
+        return result.returncode == 0
+
+    _log("repo has its own Dockerfile -- trying to build from source directly")
+    if _build():
+        _log(f"built {tag} from source on the first attempt (no pre-build needed)")
+        return tag
+
+    manifest_map = _scan_manifests(repo_path)
+    ecosystem = next((eco for eco in manifest_map if eco in _SOURCE_BUILD_MAP), None)
+    if not ecosystem:
+        _log("docker build . failed and no known pre-build step applies -- "
+             "falling back to manifest+Qwen inference")
+        return None
+
+    _log(f"docker build . failed -- running a real {ecosystem} pre-build "
+         f"(the repo's Dockerfile expects a pre-built artifact) then retrying")
+    if not _prebuild_from_source(repo_path, ecosystem, manifest_map[ecosystem]):
+        return None
+    if _build():
+        _log(f"built {tag} from source after the {ecosystem} pre-build step")
+        return tag
+    return None
+
+
+def _write_prebuilt_compose(repo_path: str, image_tag: str) -> str:
+    """ARGUS-SCANNER: Minimal single-service compose file wrapping an
+    already-built image (from _try_build_from_dockerfile) -- no Qwen call
+    needed, ports come straight from the Dockerfile's own EXPOSE
+    directives (deterministic, zero-GPU)."""
+    ports = _dockerfile_exposed_ports(os.path.join(repo_path, "Dockerfile"))
+    service_name = re.sub(r'[^a-z0-9]+', '-', os.path.basename(repo_path).lower()) or "app"
+    compose = {
+        "services": {
+            service_name: {
+                "image": image_tag,
+                "ports": [f"{p}:{p}" for p in ports] if ports else [],
+            }
+        }
+    }
+    compose_path = os.path.join(repo_path, "docker-compose.argus.yml")
+    with open(compose_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(compose, f)
+    return compose_path
+
+
 def build_victim_topology(repo_path: str) -> dict:
     """
     ARGUS-SCANNER: Detects all application layers in the repo and builds
@@ -429,8 +662,14 @@ def build_victim_topology(repo_path: str) -> dict:
     planning.
 
     Step 1: use a real docker-compose.yml at the repo root if present.
-    Step 2/3: otherwise scan for manifests and have Qwen infer a compose
-    file from them (the one GPU-touching path in this module).
+    Step 2: if the repo has its own Dockerfile, build from source --
+    guarantees the running container matches the exact analyzed commit
+    (see _try_build_from_dockerfile's docstring for why this matters and
+    when it was added).
+    Step 3: otherwise (or if the source build fails) scan for manifests
+    and have Qwen infer a compose file from them (the one GPU-touching
+    path in this module) -- unpinned to any specific commit, but the
+    long-standing fallback that always works.
     """
     for filename in ("docker-compose.yml", "docker-compose.yaml"):
         compose_path = os.path.join(repo_path, filename)
@@ -439,7 +678,13 @@ def build_victim_topology(repo_path: str) -> dict:
             _compose_up(compose_path)
             return _parse_topology(compose_path)
 
-    _log("no compose file found, scanning manifests")
+    image_tag = _try_build_from_dockerfile(repo_path)
+    if image_tag:
+        compose_path = _write_prebuilt_compose(repo_path, image_tag)
+        _compose_up(compose_path)
+        return _parse_topology(compose_path)
+
+    _log("no compose file and no buildable Dockerfile -- scanning manifests")
     manifest_map = _scan_manifests(repo_path)
     if not manifest_map:
         raise ValueError(

@@ -6,8 +6,11 @@ home, `SCHEDULE.md` is the historical pacing log, `SESSION_HANDOFF.md` is the
 last live handoff. This file is the decision-oriented master list — task IDs
 (R1, P1…) are stable so they can be referenced when planning._
 
-Last synced: 2026-08-24 (R2 section re-verified against the actual committed
-result files, not the narrative summary docs — see below).
+Last synced: 2026-09-02 (P2.2/P2.3 section below updated with a full week+ of
+real Pass-3 dynamic-analysis work not previously recorded here, plus a failed
+2026-09-02 full-scale re-validation attempt — full detail in `BACKLOG.md`'s
+"Pass 3 dynamic-analysis validation & fixes" section. R2 section below still
+reflects the 2026-08-24 re-verification pass, itself still accurate).
 
 ---
 
@@ -824,15 +827,51 @@ that. `PAPER_CLAIMS.md` still needs the same pass.
 - [~] P2.3 — Days 12–14 real product test: full WebGoat/axios scan + multiple
       GraphRange scenarios, end to end, "like a user."
       **GraphRange half done** — see P2.1 above (3 real scenarios: MySQL,
-      Cyrus, Apache). **WebGoat half in progress** (see P2.2 above for the
-      infrastructure this took) — a real `run_scanner()` call against the
-      actual `https://github.com/WebGoat/WebGoat` repo, not a synthetic
-      test, currently running via the Colab tunnel
-      (`results/p2_3_webgoat_run4.log`). **axios half not yet started** —
-      axios is a library, not a deployable service, so it won't exercise
-      `build_victim_topology()`'s dynamic path the way WebGoat does; expect
-      it to mostly exercise the static `scan_repo()` pass against real
-      historical CVE-relevant code, a smaller task than WebGoat was.
+      Cyrus, Apache). **WebGoat half substantially advanced since this was
+      last written (2026-08-25/26) — full detail in `BACKLOG.md`'s "Pass 3
+      dynamic-analysis validation & fixes" section, summary here:**
+      - The full 385-flag → 210-genuine-finding → 136-cluster WebGoat scan
+        completed for real (multi-day Colab/local compute rotation), and
+        was **re-run to completion twice more** chasing two real,
+        sequentially-discovered bugs in the red agent's execution path:
+        an assessment tie-break that silently overrode Qwen's own
+        dissent (fixed 2026-08-29), then a tool-selection mismatch where
+        87% of exploitation attempts used an irrelevant tool (fixed
+        2026-08-31, real per-technique overrides added).
+      - Investigating a stubbornly-0% success rate even after both fixes
+        surfaced the deepest finding: dynamic-analysis containers were
+        built from an inferred *public* image, not the analyzed commit —
+        WebGoat's ran a build over a year older than the source Pass 1/2
+        actually scanned. **This is a general risk for any repo without
+        its own `docker-compose.yml`, not WebGoat-specific**, and is now
+        fixed generally (`victim_builder.py` builds from the repo's own
+        Dockerfile+source first, falling back to the old inference path
+        only if that fails).
+      - Also built and live-verified this session: a real, isolated
+        attacker container per scenario (tools no longer run inside the
+        app under test); a `usage_pattern` field on tool nodes so
+        exploits are genuinely armed commands, not bare tool names;
+        credential-discovery + authentication + route-discovery, chained
+        together and confirmed working end-to-end against the real,
+        source-matched container.
+      - Also fixed since: three attacker-image tool-dependency gaps (no
+        `git`/JVM/Ruby in the `graphrange-red` base image, silently
+        breaking jwt_tool/ysoserial/xxeinjector's installs for the whole
+        prior saga) and a placeholder-value bug in `_build_invocation()`
+        — full detail in `BACKLOG.md`.
+      - **Not yet done**: a full 136-cluster re-validation with the
+        complete fix stack was attempted 2026-09-02 but is invalid — the
+        Ollama tunnel died ~8 patterns in and never recovered, so most of
+        the run skipped with connection errors. Everything above is still
+        only verified via targeted live tests, not a fresh end-to-end
+        report. Re-running that full re-validation (with tunnel-death
+        rotation) is the concrete next step before any updated
+        success-rate number is citable.
+      **axios half not yet started** — axios is a library, not a
+      deployable service, so it won't exercise `build_victim_topology()`'s
+      dynamic path the way WebGoat does; expect it to mostly exercise the
+      static `scan_repo()` pass against real historical CVE-relevant code,
+      a smaller task than WebGoat was.
 
 ### P3 — Browser verification `no-GPU`
 - [ ] P3.1 — Confirm TelemetryPanel polling + `GraphView.navigateTo()` pan/zoom in a

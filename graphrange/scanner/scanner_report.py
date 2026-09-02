@@ -30,9 +30,13 @@ TYPE_COLOR = {
 }
 
 
-def _finding_header(vc: dict) -> str:
+def _finding_header(vc: dict, blue: dict) -> str:
+    # priority is set by scanner_blue.analyze() on `blue`, not on the
+    # VulnContext -- found live 2026-08-29: every finding in the completed
+    # WebGoat report showed "priority ?" because this read vc.get('priority')
+    # instead, which never existed there in the first place.
     return (f"[{vc.get('cwe', '?')}] — {vc.get('vuln_type', '?')} — "
-            f"{vc.get('severity', '?')} — priority {vc.get('priority', '?')}")
+            f"{vc.get('severity', '?')} — priority {blue.get('priority', '?')}")
 
 
 def _kill_chain_rows(execution_result: dict) -> list:
@@ -79,7 +83,7 @@ def _write_markdown(findings: list, path: str) -> None:
         vc, red, blue = finding["vuln_context"], finding["red"], finding["blue"]
         exec_result = red.get("execution_result", {})
 
-        lines.append(f"## {_finding_header(vc)}")
+        lines.append(f"## {_finding_header(vc, blue)}")
         lines.append(f"**File:** {vc.get('filepath', '?')} lines "
                       f"{vc.get('line_start', '?')}-{vc.get('line_end', '?')}")
         lines.append(f"**Matched Technique:** {red.get('matched_technique_id') or 'none found in graph'}")
@@ -153,7 +157,20 @@ def _md_table(rows: list) -> list:
     return out
 
 
+def _html_escape(text) -> str:
+    return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _write_pdf(findings: list, path: str) -> None:
+    """ARGUS-SCANNER: reportlab's Paragraph() parses its text as a small
+    XML-like markup dialect (<b>, <br/>, etc.) -- found live 2026-08-27 on
+    a real WebGoat run: an LLM-generated description/code-fix field containing
+    an ordinary `<` (a Java generic like List<String>, an XSS example, any
+    code snippet) breaks its parser with "parse ended with N unclosed tags"
+    and crashes report generation entirely, on the very last step after
+    hours of real compute. Every free-text field must be escaped the same
+    way _write_html() already does -- Paragraph's markup subset is HTML-
+    compatible, so the same _html_escape() works here too."""
     doc = SimpleDocTemplate(path, pagesize=letter)
     styles = getSampleStyleSheet()
     story = [Paragraph("ARGUS Scanner Report", styles["Title"]), Spacer(1, 12)]
@@ -162,22 +179,25 @@ def _write_pdf(findings: list, path: str) -> None:
         vc, red, blue = finding["vuln_context"], finding["red"], finding["blue"]
         exec_result = red.get("execution_result", {})
 
-        story.append(Paragraph(_finding_header(vc), styles["Heading2"]))
+        story.append(Paragraph(_html_escape(_finding_header(vc, blue)), styles["Heading2"]))
         story.append(Paragraph(
-            f"File: {vc.get('filepath', '?')} lines "
-            f"{vc.get('line_start', '?')}-{vc.get('line_end', '?')}", styles["Normal"]))
-        story.append(Paragraph(
-            f"Matched Technique: {red.get('matched_technique_id') or 'none found in graph'}",
+            f"File: {_html_escape(vc.get('filepath', '?'))} lines "
+            f"{_html_escape(vc.get('line_start', '?'))}-{_html_escape(vc.get('line_end', '?'))}",
             styles["Normal"]))
         story.append(Paragraph(
-            f"Matched CVE: {red.get('matched_cve_id') or 'none found in graph'}", styles["Normal"]))
+            f"Matched Technique: "
+            f"{_html_escape(red.get('matched_technique_id') or 'none found in graph')}",
+            styles["Normal"]))
+        story.append(Paragraph(
+            f"Matched CVE: {_html_escape(red.get('matched_cve_id') or 'none found in graph')}",
+            styles["Normal"]))
         story.append(Spacer(1, 8))
         story.append(Paragraph("Vulnerability", styles["Heading3"]))
-        story.append(Paragraph(vc.get("description", "") or "(none)", styles["Normal"]))
+        story.append(Paragraph(_html_escape(vc.get("description", "")) or "(none)", styles["Normal"]))
         story.append(Spacer(1, 8))
 
         if exec_result.get("status") != "skipped" and exec_result.get("phases"):
-            table = Table(_kill_chain_rows(exec_result))
+            table = Table([[_html_escape(c) for c in row] for row in _kill_chain_rows(exec_result)])
             table.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(TYPE_COLOR["technique"])),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -189,15 +209,12 @@ def _write_pdf(findings: list, path: str) -> None:
             story.append(Spacer(1, 8))
 
         story.append(Paragraph("Mitigation (Blue)", styles["Heading3"]))
-        story.append(Paragraph(f"Code Fix: {blue.get('code_fix', '') or '(none)'}", styles["Normal"]))
-        story.append(Paragraph(f"Priority: {blue.get('priority', '?')}", styles["Normal"]))
+        story.append(Paragraph(
+            f"Code Fix: {_html_escape(blue.get('code_fix', '')) or '(none)'}", styles["Normal"]))
+        story.append(Paragraph(f"Priority: {_html_escape(blue.get('priority', '?'))}", styles["Normal"]))
         story.append(PageBreak())
 
     doc.build(story)
-
-
-def _html_escape(text) -> str:
-    return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _html_table(rows: list) -> str:
@@ -235,7 +252,7 @@ def _write_html(findings: list, path: str) -> None:
         exec_result = red.get("execution_result", {})
 
         parts.append("<div class='finding'>")
-        parts.append(f"<h2>{_html_escape(_finding_header(vc))}</h2>")
+        parts.append(f"<h2>{_html_escape(_finding_header(vc, blue))}</h2>")
         parts.append(f"<p><b>File:</b> {_html_escape(vc.get('filepath', '?'))} lines "
                       f"{_html_escape(vc.get('line_start', '?'))}-"
                       f"{_html_escape(vc.get('line_end', '?'))}</p>")

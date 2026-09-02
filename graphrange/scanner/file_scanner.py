@@ -36,8 +36,23 @@ SKIP_EXTENSIONS = {'.class', '.jar', '.war', '.png', '.jpg', '.gif',
 # shipped product surface. This is a real, common SAST convention (most
 # scanners default to skipping test trees), not a WebGoat-specific
 # workaround -- these directory names are near-universal across ecosystems.
+#
+# Build-output dirs added 2026-09-01 -- found live when victim_builder.py's
+# new source-build path (see BACKLOG.md) started running a real `mvn
+# package` bind-mounted into the staged repo itself, leaving real build
+# artifacts (target/*.jar, compiled classes) inside the exact directory
+# tree this scanner walks. One artifact slipped past SKIP_EXTENSIONS too:
+# Maven's shade-plugin renames the pre-shaded jar to `*.jar.original` --
+# `os.path.splitext` only strips the LAST suffix, so its extension is
+# `.original`, not `.jar`, and it was read as a giant garbled "text" work
+# unit. Directory-level exclusion is the more general fix (covers every
+# build tool's own artifact-naming quirks in one place, not just this one
+# double-extension case) -- these names are near-universal across
+# ecosystems the same way the test-dir names above are.
 SKIP_DIRS = {'.git', 'test', 'tests', '__tests__', 'spec', 'specs',
-             'it', 'integration-test', 'integration-tests'}
+             'it', 'integration-test', 'integration-tests',
+             'target', 'build', 'dist', 'out', 'bin', 'obj',
+             'node_modules', '__pycache__'}
 MAX_FILE_TOKENS = 6000   # Qwen3 8B safe context per call
 CHUNK_OVERLAP = 200      # token overlap between chunks
 # 2, found via a real live sweep 2026-08-24 against a Colab T4 -- the
