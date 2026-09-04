@@ -6,9 +6,12 @@ home, `SCHEDULE.md` is the historical pacing log, `SESSION_HANDOFF.md` is the
 last live handoff. This file is the decision-oriented master list — task IDs
 (R1, P1…) are stable so they can be referenced when planning._
 
-Last synced: 2026-09-02 (P2.2/P2.3 section below updated with a full week+ of
-real Pass-3 dynamic-analysis work not previously recorded here, plus a failed
-2026-09-02 full-scale re-validation attempt — full detail in `BACKLOG.md`'s
+Last synced: 2026-09-04 (P2.2/P2.3 section below updated with the real
+`/deliver`-404 root-cause fix behind the persistent ~0% success rate, four
+more tool-install fixes, the ysoserial/XStream mapping fix, general HTML-crawl
+route discovery, and three real target-environment bugs found + partly fixed
+(DB corruption, a seeded-account schema bug, and thin doc-sourced findings) —
+proven with one verified real exploit success. Full detail in `BACKLOG.md`'s
 "Pass 3 dynamic-analysis validation & fixes" section. R2 section below still
 reflects the 2026-08-24 re-verification pass, itself still accurate).
 
@@ -859,14 +862,38 @@ that. `PAPER_CLAIMS.md` still needs the same pass.
         breaking jwt_tool/ysoserial/xxeinjector's installs for the whole
         prior saga) and a placeholder-value bug in `_build_invocation()`
         — full detail in `BACKLOG.md`.
-      - **Not yet done**: a full 136-cluster re-validation with the
-        complete fix stack was attempted 2026-09-02 but is invalid — the
-        Ollama tunnel died ~8 patterns in and never recovered, so most of
-        the run skipped with connection errors. Everything above is still
-        only verified via targeted live tests, not a fresh end-to-end
-        report. Re-running that full re-validation (with tunnel-death
-        rotation) is the concrete next step before any updated
-        success-rate number is citable.
+      - **2026-09-03/04 — found and fixed the actual root cause of the
+        persistent ~0% success rate**: `_deliver_tool()` was POSTing to a
+        `/deliver` route that has never existed on the supervisor (a real
+        404) — every technique-override tool install silently failed
+        this entire saga, for every prior run. Fixed to use the real
+        `/exec`-based protocol; also fixed 4 more tools with the same
+        generic-`sudo`-placeholder gap, the ysoserial/XStream tool
+        mapping (architecturally wrong tool, not a naming issue — full
+        detail in BACKLOG.md), and added a general HTML-crawl route
+        discovery step. Then, pushed to explain the still-persistent 0%
+        rate concretely rather than accept it: found and fixed real
+        target-DB corruption (25+ hours of test churn) and a
+        seeded-account schema-naming bug, and proved with a real,
+        verified exploit success (`lessonCompleted: true` against
+        WebGoat's real SqlInjection lesson) that the target is genuinely
+        exploitable and the pipeline can reach success when given
+        accurate source information — the deepest remaining cause is
+        that thin, doc-mention-sourced findings (vs. real vulnerable
+        code) leave Qwen guessing the wrong *kind* of exploit, not just
+        the wrong argument.
+      - **Not yet done**: a scoped 14-cluster representative sample
+        (chosen for tool/technique diversity, not the full 136) was
+        interrupted at 9/14 clusters once the DB-corruption cause was
+        found mid-run — those 9 results predate the container rebuild
+        and shouldn't be trusted as reflecting real exploit difficulty.
+        The fresh-registration account fallback and source-grounded
+        `code_block` selection are both proven live by hand but not yet
+        wired into the actual scanner code. A clean re-run of the scoped
+        sample against the rebuilt container is the concrete next step
+        before any updated success-rate number is citable — full detail
+        in BACKLOG.md's "Pass 3 dynamic-analysis validation & fixes"
+        section.
       **axios half not yet started** — axios is a library, not a
       deployable service, so it won't exercise `build_victim_topology()`'s
       dynamic path the way WebGoat does; expect it to mostly exercise the

@@ -38,6 +38,39 @@ _HARD_FAILURE_MARKERS = (
     "no route to host", "timed out",
 )
 
+_OPTION_LIST_STOPWORDS = frozenset({
+    "usage", "available", "payload", "authors", "dependencies", "options",
+})
+
+
+def _extract_valid_options(stdout: str) -> list[str]:
+    """ARGUS-SCANNER: Some CLI tools fail with a highly structured shape --
+    an "Invalid <noun> '<value>'" line, followed by a table/list of the
+    real valid values (ysoserial's payload-type table is exactly this).
+    Found live 2026-09-03: a retry fed the raw failed stdout back to Qwen
+    (which already includes this list), but Qwen still repeated a near-miss
+    gadget name (`XStream1` instead of `XStream`) -- reading a table
+    correctly inside a wall of text is a weaker signal than being handed the
+    exact whitelist directly. This regex-extracts that whitelist so the
+    retry prompt can say "pick one of these exact strings" instead of
+    hoping the model parses it out unprompted. Returns [] if the output
+    doesn't match this shape -- most tool failures won't, and that's fine,
+    the plain retry-with-feedback still applies."""
+    m = re.search(r"(?im)^\s*invalid\s+\S+.*$", stdout)
+    if not m:
+        return []
+    options = []
+    for line in stdout[m.end():].splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if options:
+                break
+            continue
+        tok = re.match(r"^([A-Za-z][A-Za-z0-9_]{2,40})\b", stripped)
+        if tok and tok.group(1).lower() not in _OPTION_LIST_STOPWORDS:
+            options.append(tok.group(1))
+    return options[:40]
+
 _CAPABILITY_BROADEN_MAP = [
     (("scan", "discover", "enum"), "scanner"),
     (("exploit", "inject", "exec"), "exploitation"),
@@ -73,6 +106,21 @@ _TECHNIQUE_TOOL_OVERRIDES = [
     # they're the real, standard tool for each technique. Added by hand
     # 2026-08-31 with real (non-apt) install commands; see tool_graph.py.
     (("jwt", "json web token"), "jwt_tool"),
+    # Checked BEFORE the generic deserialization entry below -- confirmed
+    # live 2026-09-04 via a complete, byte-verified ysoserial-all.jar
+    # payload listing (18 real gadget types: CommonsCollections1-7,
+    # Spring1/2, Groovy1, etc.) that ysoserial has no XStream gadget at
+    # all and never did. That's not a naming mismatch to retry around --
+    # ysoserial generates payloads for Java's native
+    # ObjectInputStream.readObject() gadget chains, an entirely different
+    # mechanism from XStream's own XML-based deserialization (exploited by
+    # crafting XML that abuses XStream's type-converter/reflection
+    # handling directly, e.g. CVE-2013-2170). Routed to curl instead, the
+    # same "no dedicated tool, direct HTTP/payload construction" pattern
+    # CSRF/IDOR already use below -- Qwen's own general knowledge of
+    # XStream's well-documented public XML gadget syntax plus this
+    # finding's real vuln_context is what builds the payload, not a tool.
+    (("xstream",), "curl"),
     (("deserialization", "deserialize"), "ysoserial"),
     (("xxe", "xml external entity"), "xxeinjector"),
     # CSRF and IDOR have no dedicated tool anywhere in the security tooling
@@ -198,19 +246,49 @@ def _plan_attack_path(topology: dict, driver, vuln_context: dict) -> dict:
     })
 
 
-def _deliver_tool(supervisor_url: str, container_name: str, tool_name: str,
-                   install_from_cache: bool = False) -> bool:
-    """ARGUS-SCANNER: Delivers a tool to a specific container. Cache hits
-    skip the tool graph lookup entirely -- the name is already known from
-    resolving this capability on an earlier container this scenario."""
+def _deliver_tool(supervisor_url: str, container_name: str, install_command: str) -> bool:
+    """ARGUS-SCANNER: Installs a tool into a container by exec'ing its real
+    install_command via /exec -- the supervisor has no dedicated /deliver
+    route (confirmed live 2026-09-03 via a raw 404); /exec's own handler
+    special-cases any command containing "install" and runs it as a real
+    install server-side instead of a literal shell command, mirroring
+    agents/red.py's real, working delivery path exactly. This function
+    previously POSTed {"tool_name": ...} to that nonexistent /deliver
+    route, and every caller silently discarded its always-False return --
+    so every technique-override tool (ysoserial, xxeinjector, jwt_tool,
+    etc.) was never actually installed for this entire multi-day
+    validation saga. Exploitation then failed for an infrastructure
+    reason (tool missing), not a real exploit signal -- the AND-gate in
+    _assess_objective() still scored it not-achieved, but for the wrong,
+    undetectable reason, floor-capping every measured success rate at
+    ~0% regardless of any other fix. Takes the install_command string
+    directly (not a tool_name) -- callers that only have a tool_name look
+    it up via get_tool_by_name() first, same as the pre-existing dirb call
+    below already did correctly by passing a ready command."""
     try:
         resp = requests.post(
-            f"{supervisor_url}/deliver",
-            json={"container": container_name, "tool_name": tool_name,
-                  "install_from_cache": install_from_cache},
-            timeout=60,
+            f"{supervisor_url}/exec",
+            json={"container": container_name, "command": install_command},
+            # 450s, not 90s -- confirmed live 2026-09-03 that a genuinely cold
+            # `apt-get update && apt-get install <pkg>` plus a jar download
+            # can exceed 90s on real network conditions, timing out a request
+            # that would otherwise have succeeded (ReadTimeout, not a real
+            # install failure). Bumped twice more same day: isolated testing
+            # showed ysoserial/padbuster/xxeinjector all genuinely need
+            # 120-240s on a slow network day, and a direct exec_run (no
+            # client timeout at all) proved default-jre-headless's install
+            # for ysoserial can legitimately run 300-400s+ -- almost all of
+            # it spent in ca-certificates-java's postinst re-processing the
+            # entire system CA bundle, not the download itself. commix
+            # remains heavy enough to exceed even this and is excluded from
+            # the P2.3 representative sample rather than chasing an
+            # ever-larger timeout for one outlier. One-time cost per
+            # attacker-container-per-cluster, not a hot path, so the extra
+            # headroom is cheap.
+            timeout=450,
         )
-        return resp.status_code == 200
+        resp.raise_for_status()
+        return bool(resp.json().get("success"))
     except requests.RequestException:
         return False
 
@@ -232,15 +310,21 @@ def _request_tool_for_phase(phase: dict, acquired_capabilities: dict,
 
     if capability in acquired_capabilities:
         known_tool = acquired_capabilities[capability]
-        _deliver_tool(supervisor_url, container_name, known_tool, install_from_cache=True)
-        return {"tool": known_tool, "status": "acquired",
+        install_command = (get_tool_by_name(driver, known_tool) or {}) \
+            .get("properties", {}).get("install_command", "")
+        delivered = bool(install_command) and _deliver_tool(
+            supervisor_url, container_name, install_command)
+        return {"tool": known_tool, "status": "acquired" if delivered else "blocked",
                 "installed_tool_used": None, "log_entry": None}
 
     override_tool = _technique_tool_override(phase, driver)
     if override_tool:
-        _deliver_tool(supervisor_url, container_name, override_tool)
+        install_command = (get_tool_by_name(driver, override_tool) or {}) \
+            .get("properties", {}).get("install_command", "")
+        delivered = bool(install_command) and _deliver_tool(
+            supervisor_url, container_name, install_command)
         acquired_capabilities[capability] = override_tool
-        return {"tool": override_tool, "status": "acquired",
+        return {"tool": override_tool, "status": "acquired" if delivered else "blocked",
                 "installed_tool_used": None, "log_entry": None}
 
     broadening_terms = [
@@ -494,7 +578,7 @@ def _teardown_attacker(supervisor_url: str, attacker_container: str | None) -> N
 
 def _build_invocation(tool_name: str, phase: dict, vuln_context: dict,
                        target_url: str, driver, cookie_jar: str = "",
-                       path_hints: tuple = ()) -> str:
+                       path_hints: tuple = (), retry_feedback: str = "") -> str:
     """ARGUS-SCANNER: Builds the actual shell command to run in the attacker
     container.
 
@@ -545,8 +629,12 @@ def _build_invocation(tool_name: str, phase: dict, vuln_context: dict,
         f"How this tool is invoked: "
         f"{usage_pattern or '(no usage pattern on file -- use your own knowledge of this tool)'}\n"
         f"{session_note}"
-        f"{hints_note}\n"
-        f"Vulnerability type: {vuln_context.get('vuln_type', '?')} ({vuln_context.get('cwe', '?')})\n"
+        f"{hints_note}"
+        + (f"\nRETRY -- your previous attempt did not work:\n{retry_feedback}\n"
+           "Do not repeat the same command. Pick a different gadget/payload "
+           "name, endpoint guess, or parameter -- something genuinely "
+           "different, not a cosmetic rewording.\n" if retry_feedback else "")
+        + f"\nVulnerability type: {vuln_context.get('vuln_type', '?')} ({vuln_context.get('cwe', '?')})\n"
         f"Vulnerable code:\n{vuln_context.get('code_block', '')}\n"
         f"Description: {vuln_context.get('description', '')}\n"
         f"Attack vector: {vuln_context.get('attack_vector', '')}\n"
@@ -570,7 +658,13 @@ def _build_invocation(tool_name: str, phase: dict, vuln_context: dict,
         "never write a bracketed placeholder like <captured_token> or "
         "<cracked_secret> into the final command; the shell will try to "
         "execute that literally and it will fail immediately (`<x` is "
-        "input redirection, not a value to fill in later).\n"
+        "input redirection, not a value to fill in later). If the value "
+        "you're capturing lives in a response HEADER (a Set-Cookie value, "
+        "a token header, anything from `grep`-ing for a header name), "
+        "plain `curl -s` is NOT enough -- it only returns the response "
+        "body, never headers, so grepping it for a header name will always "
+        "come back empty. Use `curl -s -D -` (or `-i`) to include headers "
+        "in the output you then grep.\n"
         'Return ONLY: {"command": str}'
     )
     raw = _call_qwen(prompt, "scanner.scanner_red._build_invocation")
@@ -706,6 +800,82 @@ def _authenticate(supervisor_url: str, attacker_container: str,
     return ""
 
 
+def _crawl_links(html: str) -> list[str]:
+    """ARGUS-SCANNER: General, framework-agnostic route discovery -- parses
+    an already-fetched HTML response for real hrefs/form actions/script
+    srcs, instead of guessing or leaning on any one framework's own
+    introspection endpoint (Spring's /actuator/mappings, Rails routes,
+    Django's admin, etc. would each only work for that one stack, and this
+    project stays general across whatever a scanned repo happens to use).
+    Works identically no matter the backend language -- it only reads the
+    rendered output, the same way a real attacker without source access
+    would. Most server-rendered apps' own navigation IS the real route
+    map; WebGoat in particular is a lesson-navigation UI, so this alone
+    should surface most real lesson URLs directly."""
+    paths = set()
+    for m in re.finditer(r'(?:href|action|src)=["\']([^"\']+)["\']', html, re.IGNORECASE):
+        url = m.group(1).strip()
+        if not url or url.startswith(("#", "javascript:", "mailto:", "data:")):
+            continue
+        if "://" in url:
+            continue  # same-origin paths only -- an absolute/external URL isn't a route on this app
+        path = url.split("?")[0].split("#")[0]
+        if path.startswith("/") and len(path) > 1:
+            paths.add(path)
+    return sorted(paths)
+
+
+_LANDING_PAGE_CANDIDATES = ("/welcome.mvc", "/", "/home", "/dashboard", "/index")
+_STATIC_ASSET_SUFFIXES = (".css", ".js", ".svg", ".ico", ".png", ".jpg", ".jpeg",
+                           ".gif", ".woff", ".woff2", ".ttf", ".map")
+
+
+def _crawl_authenticated_links(supervisor_url: str, attacker_container: str,
+                                target_url: str, cookie_jar: str,
+                                path_hints: tuple = ()) -> list[str]:
+    """ARGUS-SCANNER: Fetches the real, authenticated landing page and
+    crawls it for real links via _crawl_links() -- the cheapest, most
+    accurate route-discovery signal available once a session exists,
+    since it reads what the app itself actually links to rather than
+    guessing or brute-forcing a wordlist. General across landing-page
+    naming conventions (not just WebGoat's own /welcome.mvc) by trying a
+    handful of common candidates with each known path prefix. -L is
+    required -- confirmed live 2026-09-04 that a plain `curl -s` on a
+    redirecting landing path returns an empty body (the redirect itself
+    has none), silently producing zero links; -L follows it to the real
+    rendered page. Does one more hop into the first few non-static
+    same-origin links found, since a real landing/splash page often links
+    to the actual navigation/menu page rather than containing every
+    route itself (confirmed live: WebGoat's welcome.mvc links to
+    start.mvc, not the lesson menu directly)."""
+    candidates = [f"{prefix}{suffix}" for prefix in (list(path_hints) + [""])
+                  for suffix in _LANDING_PAGE_CANDIDATES]
+    all_links: set[str] = set()
+    fetched: set[str] = set()
+    for candidate in candidates:
+        if candidate in fetched:
+            continue
+        fetched.add(candidate)
+        html = _exec_in_container(supervisor_url, attacker_container,
+                                   f"curl -s -L -b {cookie_jar} -m 10 {target_url}{candidate}")
+        links = _crawl_links(html)
+        if links:
+            all_links.update(links)
+            break
+    hops = 0
+    for link in sorted(all_links):
+        if hops >= 3:
+            break
+        if link.endswith(_STATIC_ASSET_SUFFIXES) or link in fetched:
+            continue
+        fetched.add(link)
+        html = _exec_in_container(supervisor_url, attacker_container,
+                                   f"curl -s -L -b {cookie_jar} -m 10 {target_url}{link}")
+        all_links.update(_crawl_links(html))
+        hops += 1
+    return sorted(all_links)
+
+
 def _execute_attack_plan(attack_plan: dict, topology: dict,
                           supervisor_url: str, driver, vuln_context: dict,
                           credentials: dict | None = None) -> dict:
@@ -765,6 +935,11 @@ def _execute_attack_plan(attack_plan: dict, topology: dict,
                     cookie_jar = _authenticate(
                         supervisor_url, attacker_container, target_url, credentials,
                         path_hints=tuple(path_hints))
+            if cookie_jar:
+                crawled = _crawl_authenticated_links(
+                    supervisor_url, attacker_container, target_url, cookie_jar,
+                    path_hints=tuple(path_hints))
+                path_hints.extend(p for p in crawled if p not in path_hints)
 
     try:
         for phase in phases:
@@ -802,15 +977,51 @@ def _execute_attack_plan(attack_plan: dict, topology: dict,
             assessment = _assess_objective(phase.get("objective", ""), obs, stdout, driver,
                                             exploit_condition=phase.get("exploit_condition", ""))
 
+            # One bounded retry on any not-achieved result -- added
+            # 2026-09-03 after live reproduction showed a real, low-
+            # probability-but-real failure mode: Qwen picking a wrong
+            # gadget/payload name (e.g. ysoserial's "XStream1" instead of
+            # "XStream") rather than the exploit genuinely being
+            # unreachable. A single retry, fed the prior command+stdout so
+            # Qwen tries something actually different rather than repeating
+            # itself, catches that class without letting a scenario loop
+            # forever on a truly unexploitable finding.
+            retried = False
+            if not assessment["achieved"]:
+                retried = True
+                feedback = f"Command: {command}\nOutput: {stdout[:800]}"
+                valid_options = _extract_valid_options(stdout)
+                if valid_options:
+                    feedback += (
+                        f"\nThe tool's own output lists these EXACT valid "
+                        f"values: {valid_options}. If your previous command "
+                        f"used an invalid enum/type/payload name, you MUST "
+                        f"pick one of these exact strings verbatim, not a "
+                        f"variation of it.")
+                command = _build_invocation(active_tool, phase, vuln_context, target_url,
+                                             driver, cookie_jar=cookie_jar,
+                                             path_hints=tuple(path_hints),
+                                             retry_feedback=feedback)
+                stdout = _exec_in_container(supervisor_url, attacker_container, command)
+                obs = normalize(stdout, phase.get("technique_id", ""), driver)
+                assessment = _assess_objective(
+                    phase.get("objective", ""), obs, stdout, driver,
+                    exploit_condition=phase.get("exploit_condition", ""))
+
             all_blocked = False
             phase_results.append({
                 "service": container_name, "tool": active_tool,
                 "status": tool_result["status"],
-                "result": "success" if assessment["achieved"] else "partial",
+                # Was "partial" -- a misleading label with no real third
+                # state (every not-achieved case hit it uniformly, whether
+                # a genuine partial-progress attempt or a flat qwen=False
+                # rejection). "not_achieved" says what actually happened.
+                "result": "success" if assessment["achieved"] else "not_achieved",
                 "execution_evidence": assessment["execution_evidence"],
                 "qwen_signal": assessment["qwen_signal"],
                 "conflict": assessment["conflict"],
                 "observations": obs,
+                "retried": retried,
                 "pivoted": assessment["achieved"] and phase is not phases[-1],
             })
     finally:
@@ -818,7 +1029,7 @@ def _execute_attack_plan(attack_plan: dict, topology: dict,
 
     kill_chain_complete = bool(
         not all_blocked and phase_results and phases and
-        phase_results[-1]["result"] in ("success", "partial") and
+        phase_results[-1]["result"] in ("success", "not_achieved") and
         phase_results[-1]["service"] == phases[-1]["service"]
     )
     return {

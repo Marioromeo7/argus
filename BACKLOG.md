@@ -945,7 +945,7 @@ final spec state, not every intermediate version.
       (code path exists in `scanner_red.py`'s `_request_tool_for_phase()`,
       not yet exercised by a real blocked phase since that needs a live run)
 
-### Pass 3 dynamic-analysis validation & fixes (2026-08-29 → 2026-09-02)
+### Pass 3 dynamic-analysis validation & fixes (2026-08-29 → 2026-09-04)
 
 A real, full WebGoat scan (385 flags → 210 genuine findings → 136
 `(vuln_type, cwe)` clusters) surfaced a chain of real bugs in the
@@ -1207,6 +1207,137 @@ fix depended on the last one's finding.
       result. **The full-stack re-validation is still outstanding** — this
       attempt does not count as evidence either way for the post-fix
       success rate.
+- [x] **2026-09-03 — the real root cause of the persistent ~0% success
+      rate: `_deliver_tool()` posted to a `/deliver` route that has never
+      existed on the supervisor (confirmed live via a raw 404).** Found
+      while reproducing a deserialization conflict to explain it to the
+      user rather than assume it was correct. Every caller silently
+      discarded the always-False return, so every technique-override tool
+      (ysoserial, xxeinjector, jwt_tool, sqlmap, xsser, padbuster) was
+      never actually installed for this entire multi-day saga —
+      exploitation failed for an invisible infrastructure reason, not
+      real exploit difficulty, on every run before this one. Fixed to use
+      the real `/exec` + `install_command` protocol `agents/red.py`
+      already used correctly; callers now mark a genuine install failure
+      as `status: "blocked"` instead of a false `"acquired"`. Also fixed
+      while re-auditing all 8 curated `_TECHNIQUE_TOOL_OVERRIDES` tools:
+      sqlmap/xsser/padbuster/xxeinjector still had the generic crawled
+      `sudo apt install <name>` placeholder (no `-y`, no `apt-get
+      update`, and `sudo` doesn't exist in the attacker image) — replaced
+      with real `apt-get update -qq && apt-get install -y -qq <pkg>`
+      commands, live-verified via `which`/version checks on fresh
+      containers. `_deliver_tool()`'s timeout raised 90s → 450s across two
+      more live-evidenced bumps (a direct, timeout-free `exec_run` proved
+      ysoserial's `default-jre-headless` install can legitimately run
+      300-400s+, almost all of it `ca-certificates-java` reprocessing the
+      whole system CA bundle) — `commix` still exceeds even that on a
+      slow-network day and is excluded from the representative sample
+      below rather than chasing an ever-larger timeout for one outlier.
+      Also fixed the `"result": "partial"` mislabeling flagged earlier
+      this saga (no real third state existed) to `"not_achieved"`.
+- [x] **2026-09-03 — one bounded retry + a fast whitelist-extraction layer
+      for wrong-argument misses.** Added: any not-achieved phase gets one
+      retry with the prior command+output fed back to Qwen
+      (`_build_invocation(..., retry_feedback=...)`); a new
+      `_extract_valid_options()` regex-parses a tool's own "Invalid X 'Y',
+      available values: ..." failure shape (confirmed live against
+      ysoserial's real payload-type table) and hands the retry an exact
+      whitelist to pick from, cheaper and more reliable than hoping the
+      model parses a wall of text unprompted. Also fixed a real curl bug
+      in the placeholder-capture prompt: `curl -s` only returns the
+      response body, never headers, so a chained `TOKEN=$(curl -s ... |
+      grep 'Set-Cookie...')` capture silently comes back empty every
+      time — confirmed live on a real JWT phase (empty stdout end to
+      end); prompt now tells Qwen to use `-D -`/`-i` for header-sourced
+      values.
+- [x] **2026-09-03/04 — the ysoserial/XStream mapping was architecturally
+      wrong, not a naming bug.** Chasing a "wrong gadget name" retry
+      miss down to the byte level (a full, size-verified
+      `ysoserial-all.jar` md5-checked against GitHub's real release
+      asset) proved ysoserial's real, complete payload catalog (18 real
+      gadget types: CommonsCollections1-7, Spring1/2, Groovy1, etc.) has
+      **no XStream gadget at all and never did** — an earlier "XStream is
+      valid" belief traced back to a row the session itself had
+      fabricated in a unit-test fixture, never a genuine live capture.
+      ysoserial targets Java's native `ObjectInputStream` gadget chains;
+      XStream findings need a hand-crafted XML payload abusing XStream's
+      own type-converter/reflection handling instead (CVE-2013-2170
+      style) — a different mechanism entirely, unfixable by any retry.
+      `_TECHNIQUE_TOOL_OVERRIDES` now routes `"xstream"` to `curl` before
+      the generic `"deserialization"` → `ysoserial` entry, same
+      no-dedicated-tool pattern CSRF/IDOR already use; curl's
+      `usage_pattern` extended with the real gadget syntax. Live-verified:
+      Qwen produced a real, syntactically-correct
+      `<java.util.HashMap><entry><key><java.lang.ProcessBuilder>...`
+      payload on the first try post-fix — the only remaining failure was
+      a missing endpoint path, a real, separate, already-documented gap
+      (below), not a payload problem.
+- [x] **2026-09-04 — general, framework-agnostic route discovery: crawl
+      the real authenticated page instead of guessing.** User pushed back
+      correctly on an initial Java/Spring-Actuator-specific idea (against
+      this project's own general-purpose design) in favor of parsing
+      whatever HTML a login actually returns — works identically
+      regardless of backend language. Added `_crawl_links()` (regex over
+      href/action/src) and `_crawl_authenticated_links()` (tries a few
+      common landing-page names with `-L`, then one more hop into
+      non-static discovered links) into `_execute_attack_plan()`'s auth
+      flow. Live-verified: correctly pulled real routes
+      (`/WebGoat/logout`, `/WebGoat/registration`, `/WebGoat/start.mvc`)
+      that dirb's wordlist would never find. **Honest limit found in the
+      same investigation**: WebGoat's real lesson menu loads via
+      client-side JS (`require.min.js`) calling a session-scoped service
+      endpoint (`/service/lessonmenu.mvc`, real, returns `200` but `[]`
+      for a session that never navigated the real UI) — a static HTML
+      crawl fundamentally can't see routes that only exist behind a JS
+      bootstrap sequence. Not chased further (would need JS-bundle
+      parsing, a meaningfully bigger task); documented as a real,
+      separate gap rather than solved.
+- [x] **2026-09-04 — proved the 0%-success pattern live, with a genuine
+      successful exploit, and found three stacked, real causes.** User
+      pushed hard on "why does nothing succeed against a repo that's
+      *designed* to be trivially vulnerable" rather than accepting
+      "honest conflicts" at face value. Investigation found three real,
+      independent causes, not one: (1) **DB corruption from 25+ hours of
+      accumulated test-run churn** — a fresh account's very first-ever
+      request to an untouched lesson failed with a genuine HSQLDB
+      `DataIntegrityViolationException` on `ASSIGNMENT_PROGRESS`, fixed
+      by recreating the victim container; (2) **the seeded
+      `webgoat-admin` account's hyphen breaks per-user-schema lessons** —
+      confirmed via a real `invalid schema name: webgoat-admin` error,
+      reproducible on every request regardless of payload; a freshly
+      *registered* account (real endpoint found: `POST
+      /WebGoat/register.mvc`, real `UserForm` validation pulled straight
+      from source: username `[a-z0-9-]*` 6-45 chars, password 6-10
+      chars) sidesteps it entirely; (3) **Qwen never sees real vulnerable
+      source for RELEASE_NOTES.md/pom.xml-sourced findings**, so it has
+      no way to know a lesson's *actual* vulnerability shape. Proved (3)
+      concretely: `SqlInjectionLesson5`'s real source
+      (`statement.executeQuery(query)`, fetched directly from GitHub)
+      shows the endpoint runs the ENTIRE user input as a raw SQL
+      statement, not a WHERE-clause template — the real solution is
+      `GRANT SELECT ON GRANT_RIGHTS TO UNAUTHORIZED_USER`, checked
+      against `INFORMATION_SCHEMA.TABLE_PRIVILEGES`, nothing like a
+      classic `' OR '1'='1` bypass. Every WHERE-clause-style payload this
+      session generated failed with a genuine SQL parse error for
+      exactly this reason. Using the real payload against the
+      freshly-registered account and rebuilt container produced a real,
+      verified `"feedback": "Congratulations. You have successfully
+      completed the assignment.", "lessonCompleted": true` — direct
+      proof the target is genuinely exploitable and the pipeline can
+      reach a real success when given accurate information, not proof of
+      anything wrong with the target or the tooling in general.
+      **Not yet done**: the fresh-registration fallback is proven by hand
+      but not wired into `_execute_attack_plan()`'s actual credential
+      flow (still reuses `_find_hardcoded_credentials()`'s seeded
+      account); source-code-grounded `code_block` selection over thin
+      doc-mention findings (cause 3) is understood and reproduced but not
+      implemented. The scoped 14-cluster representative sample
+      (`results/p2_3_webgoat_sample_final.log`, 9/14 clusters complete at
+      stop) was halted mid-run once the DB-corruption cause was found,
+      since clusters completed before the container rebuild can't be
+      trusted to reflect real exploit difficulty rather than a broken
+      target — session ended here by explicit user request before a
+      clean re-run against the fixed container.
 
 ### Dashboard extensions
 - [~] Extend `dashboard/api/main.py` — `/api/telemetry`, `/api/llm/navigate`.
