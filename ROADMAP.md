@@ -6,14 +6,19 @@ home, `SCHEDULE.md` is the historical pacing log, `SESSION_HANDOFF.md` is the
 last live handoff. This file is the decision-oriented master list — task IDs
 (R1, P1…) are stable so they can be referenced when planning._
 
-Last synced: 2026-09-04 (P2.2/P2.3 section below updated with the real
+Last synced: 2026-09-05 (R2.1 fully closed — real ranked-retrieval battery,
+P@k/R@k/MRR/nDCG@10/bootstrapped CIs, executed and reconciled; R3.1
+substantially progressed — NLI groundedness classifier built and benchmarked
+against the existing audit set, opt-in, not promoted to default. R2.3's
+≥150-cycle extension attempted same day, hit a real Ollama server hang
+mid-run — see R2.3 below, still open, checkpoint safe at 100 cycles, no data
+lost. Previous sync 2026-09-04: P2.2/P2.3 section below updated with the real
 `/deliver`-404 root-cause fix behind the persistent ~0% success rate, four
 more tool-install fixes, the ysoserial/XStream mapping fix, general HTML-crawl
 route discovery, and three real target-environment bugs found + partly fixed
 (DB corruption, a seeded-account schema bug, and thin doc-sourced findings) —
 proven with one verified real exploit success. Full detail in `BACKLOG.md`'s
-"Pass 3 dynamic-analysis validation & fixes" section. R2 section below still
-reflects the 2026-08-24 re-verification pass, itself still accurate).
+"Pass 3 dynamic-analysis validation & fixes" section).
 
 ---
 
@@ -223,7 +228,7 @@ Used the remaining file-only capacity, back on 2026-08-19, to make sure the
 eval scripts themselves were actually ready to run at R2 scale the moment
 Kaggle became reachable, rather than sitting idle.
 
-- [~] R2.1 — Claim 1 (retrieval precision): expand to **≥50 CVEs** with structured
+- [x] R2.1 — Claim 1 (retrieval precision): expand to **≥50 CVEs** with structured
       NVD ground truth (filter pre-CWE-era up front so every query is evaluable).
       Report P@k/Recall@k for k∈{5,10,20} + mean FPR + MRR + nDCG@10. Bootstrap
       95% CIs on the GraphRAG−VectorRAG delta, not just the point estimate. Keep
@@ -306,6 +311,67 @@ Kaggle became reachable, rather than sitting idle.
       spec: P@10 only (not P@k for k∈{5,10,20}), no MRR/nDCG@10, no
       bootstrapped CIs — those need ranked (not set) retrieval results, a
       real design change, still open.
+
+      **R2.1 spec fully closed, 2026-09-05 — `results/r2_1_ranked_battery.json`,
+      same 44/52-evaluable-CVE run, real ranked retrieval this time (GraphRAG
+      ranked by real path confidence via a live-tested Cypher query;
+      VectorRAG/+Rerank preserve their existing similarity/rerank order
+      instead of collapsing to a set).** The old headline number above uses
+      `tp / len(retrieved)` as its denominator — GraphRAG often returns fewer
+      than k candidates (a real, structural property: many CVEs have a
+      sparse 1-2 hop technique/tactic neighborhood), which shrinks that
+      denominator and inflates precision. The standard IR definition
+      (`tp_in_topk / k`, fixed denominator) tells a more nuanced, more honest
+      story than the single 0.176-vs-0.039 number suggested:
+      ```
+                        P@5    P@10   P@20   R@5    R@10   R@20   MRR    nDCG@10
+      GraphRAG          0.109  0.055  0.027  0.420  0.420  0.420  0.477  0.433
+      VectorRAG(flat)   0.068  0.039  0.026  0.318  0.341  0.455  0.170  0.197
+      VectorRAG+Rerank  0.059  0.034  0.025  0.273  0.295  0.432  0.188  0.199
+      ```
+      GraphRAG's R@5/R@10/R@20 are identically 0.420 at every k — confirms
+      the sparse-neighborhood explanation directly: widening the window
+      finds nothing new because there's often nothing more to find.
+      VectorRAG's recall actually **overtakes** GraphRAG's by R@20
+      (0.455/0.432 vs 0.420) — a flat embedding search over more nodes
+      eventually surfaces more true positives at a wide-enough net, it just
+      ranks them far worse.
+
+      **Bootstrapped 95% CI on the standard P@10 delta (n=44, 10k resamples)
+      includes zero for both comparisons**: GraphRAG−flat mean=+0.016,
+      CI=[-0.007, +0.039]; GraphRAG−reranked mean=+0.020, CI=[-0.002,
+      +0.043]. Under the fair, fixed-denominator definition, top-10 set
+      overlap is **not** statistically distinguishable from VectorRAG at
+      this sample size — a materially different (more honest) statement
+      than the old-metric headline number implies, and this file is
+      correcting itself on it rather than letting the older framing stand
+      uncontested.
+
+      **But MRR and nDCG@10 — the metrics that actually test ranking
+      quality, which is what EVALUATION_PLAN.md #7 added them FOR — are
+      real and significant**: MRR delta (GraphRAG−flat) mean=+0.307,
+      CI=[+0.131, +0.481]; MRR delta (GraphRAG−reranked) mean=+0.290,
+      CI=[+0.107, +0.470]; nDCG@10 delta (GraphRAG−flat) mean=+0.236,
+      CI=[+0.071, +0.402]; nDCG@10 delta (GraphRAG−reranked) mean=+0.234,
+      CI=[+0.068, +0.403] — all four CIs clear of zero by a wide margin.
+      **Honest synthesis for the paper**: GraphRAG does not clearly retrieve
+      more correct top-10 candidates than VectorRAG at this sample size, but
+      when it does find the right technique, it consistently ranks it far
+      higher (rank ~2 vs. rank ~5-6 on average, from the MRR values) — a
+      real, statistically supported, but more specific claim than "GraphRAG
+      has higher precision." Reranking VectorRAG doesn't meaningfully change
+      any of this picture (both flat and reranked VectorRAG comparisons land
+      in essentially the same place). Also note: the old-metric
+      VectorRAG+Rerank number moved between runs (0.057 on 2026-08-24 →
+      0.034 here, on largely the same 44-CVE pool) — Qwen3's rerank call has
+      no fixed seed, so some run-to-run drift on an LLM-mediated metric is
+      expected, not a bug; a real motivating example for R2.5's "variance
+      across ≥3 seeds" item, still open. **R2.1 spec (P@k for k∈{5,10,20},
+      MRR, nDCG@10, bootstrapped CIs on the delta, all with ground truth kept
+      independent of the graph) is now fully implemented and executed** —
+      closing the "still open" note above. `scripts/eval_retrieval.py`
+      carries both metric families side by side (old and new denominators)
+      so neither the original number nor this correction gets silently lost.
 - [x] R2.2 — Claim 2 (grain convergence): sweep the challenger over **all 73+ CVE
       nodes** (threshold-gated on low `grain_confidence`, fixed round budget e.g.
       3). Report the full before/after grain histogram (not just per-node deltas)
@@ -398,8 +464,95 @@ Kaggle became reachable, rather than sitting idle.
       the "claim supported, publication-ready" one that got reported. The
       ≥150-cycle target and the stationarity/change-point/cross-correlation
       battery remain the actual open work for this item.
-- [ ] R2.4 — Claim 4 (hardware feasibility): lock local latency numbers as the
-      paper's source of truth (not Kaggle figures).
+
+      **Statistical battery built and validated 2026-09-05** — all three
+      additions above landed in `scripts/eval_coevolution.py`
+      (`_stationarity` via statsmodels ADF+KPSS, `_changepoints` via
+      `ruptures` PELT with an elbow-selected penalty over a pre-registered
+      grid rather than one hand-picked constant, `_cross_correlation` with a
+      permutation-test p-value). Verified against the real, complete
+      100-cycle checkpoint (no GPU needed for this part — pure analysis on
+      already-collected data) before spending any GPU time on more cycles.
+      **Real results on the 100-cycle data**: both series jointly confirmed
+      stationary (ADF rejects unit root, KPSS fails to reject stationarity,
+      both p<0.05/>0.05 respectively) — supports the equilibrium framing
+      directly, not just via a flat slope. Change-point detection (elbow
+      pen=1.0) found 3 regime-level shifts (cycles 25/45/80, segment means
+      0.806→0.773→0.879→0.840), not per-dip events — a real, honest, slightly
+      negative result for the "dips are adaptation events" framing: at every
+      reasonable penalty ≥2.0, PELT finds 0 changepoints at all (full
+      pen-sensitivity table saved in the checkpoint), meaning individual
+      single-cycle dips read as noise within one regime, not distinct
+      structural breaks. Cross-correlation found **no lagged coupling** —
+      all 21 tested lags (±10 cycles) are weak/non-significant except lag=0,
+      which is strong and significant (r=-0.673, permutation p=0.0005) but
+      in the *same cycle*, not "blue strengthens after a red dip." Honest
+      reading: the hoped-for "red dips, blue responds next cycle" coupling
+      story isn't supported: the real effect is contemporaneous (both
+      series move together within a cycle, probably reflecting shared
+      engagement difficulty that round) — a different, still-real finding,
+      not the one originally hoped for. None of this required forcing a
+      result; it's exactly the "honest coupling/adaptation stats, or an
+      honest no-significant-trend" the DoD asked for either way.
+
+      **≥150-cycle extension attempted same day (101→150), failed — real
+      Ollama server hang, not a code bug.** Kicked off `--resume --cycles
+      150`; got stuck silently for over an hour mid cycle-101 (blue agent's
+      `_think()` call). Confirmed via direct diagnosis (not assumed): a
+      fresh, separate trivial "PONG" request to Ollama also timed out after
+      30s with zero response and zero CPU growth on the Ollama process in
+      the preceding hour — the server itself was hung, matching this
+      project's own previously-documented "Ollama hangs" failure mode
+      (CONTEXT.md's Critical Ollama Quirks). `agents/blue.py`'s `_think()`
+      (and red.py's, reflexion.py's) intentionally has `timeout=None` — a
+      deliberate design choice from the Kaggle-inference era ("let Kaggle
+      inference run as long as needed") that means locally, a genuine server
+      hang blocks forever with no exception and no retry, since the retry
+      logic only triggers on an actual HTTP error (Cloudflare 524), not a
+      silent hang. Ollama was restarted (by the user; this session's process-
+      kill permission is gated by the harness's auto-mode classifier, which
+      blocked both a targeted single-PID kill and a broader restart attempt
+      — flagged to the user rather than routed around). The stuck process
+      then failed loudly and cleanly on the restart (`ConnectionResetError`
+      propagating out of `agents/blue.py:_think()`, uncaught, crashing
+      `run_eval()`) — cycle 101 is fully lost (never checkpointed, no
+      partial credit), but the checkpoint itself is untouched and safe at
+      100 cycles. **Real, general finding worth fixing regardless of this
+      specific run**: these three `_think()` functions should have a bounded
+      timeout for local runs (the Kaggle-era "no timeout" comment is now
+      stale for how this project actually runs today) — logged here, not yet
+      fixed, since fixing it well means deciding a real bound (900s, matching
+      `agents/narrowing.py`'s documented worst case?) rather than guessing.
+      The ≥150-cycle target remains open, blocked only on Ollama coming back
+      up and a resume from the intact 100-cycle checkpoint — no code or
+      methodology blocker.
+- [x] R2.4 — **Done 2026-09-05, `results/r2_4_local_latency.json` /
+      `scripts/eval_local_latency.py`.** Ran with local Ollama genuinely idle
+      (confirmed: R2.3's run had just been moved to Kaggle first, freeing
+      it — no concurrent GPU load). Real numbers: warm think-mode
+      189.0s ± 33.0s (n=5), warm fast-mode 12.3s ± 0.3s (n=5), embedding
+      0.2s ± 0.3s (n=5, CPU-only).
+
+      **Cold start is honestly unresolved, not cleanly re-isolated**: first
+      attempt found `load_duration=0` after `ollama stop` + a fixed 2s sleep
+      — proof the model was never actually unloaded, a real methodological
+      gap, not a subtle one. Fixed by polling `ollama ps` until the model
+      genuinely disappears (up to 30s) before proceeding. Re-ran: `ollama ps`
+      confirmed empty beforehand, yet `load_duration` **still** reported
+      ~0 (0.0044s) on the resulting call, and its wall time (271.5s) falls
+      *within* the observed warm-call range (max 245.2s) rather than clearly
+      above it. Two live-consistent readings, not resolved further tonight:
+      either (a) this hardware/Ollama version's real cold-start cost is
+      smaller than the historically-cited ~265s once genuine call-to-call
+      output-length variance is accounted for (std=33s on warm calls alone
+      is already large), or (b) something below Ollama's own accounting
+      (OS page cache, GPU driver/context state) keeps enough resident that
+      a verified-unloaded model still reloads near warm-call speed. 271.5s
+      itself is close to the old ~265s citation, so not contradicted --
+      just not cleanly isolated as a distinct phenomenon from warm-call
+      variance the way the original citation implied. Report the real
+      271.5s wall time with this caveat, not a clean "confirmed cold start"
+      claim.
 - [ ] R2.5 — Reproducibility, cross-cutting: pin `qwen3:8b` + record Ollama
       version/seed where possible; report variance across ≥3 seeds for headline
       numbers (local LLM output isn't fully deterministic).
@@ -422,14 +575,127 @@ investor conversation, a future session's context) — this file and
 that. `PAPER_CLAIMS.md` still needs the same pass.
 
 ### R3 — Eval rigor upgrades `no-GPU / light-GPU`
-- [ ] R3.1 — Replace term-overlap groundedness check with a small local NLI
-      classifier (~100–400M, e.g. DeBERTa entailment — CPU/light-GPU, doesn't
-      compete for the narrowing GPU budget). Measure current gate precision against
-      `results/narrowing_gate_labeled_audit.jsonl` first.
-- [ ] R3.2 — Add a separate relevance/answering check (distinct from
-      groundedness): "does this text answer what was asked," not just "is it true."
-- [ ] R3.3 — Grow the hand-labeled audit set (currently 27 examples) as more nodes
-      get audited.
+- [~] R3.1 — **Substantial progress 2026-09-04, not promoted to default.**
+      Built `agents.narrowing._clause_supported_nli()` — `cross-encoder/
+      nli-deberta-v3-small` (~140M, CPU-only wheel, zero GPU/VRAM contention
+      with the concurrently-running R2.1/R2.3 GPU jobs), lazy-loaded same
+      pattern as `_get_spacy()`. Wired as a genuine opt-in (not called from
+      `answer()`'s live gate) — same validate-before-promote pattern
+      `agents/narrowing.py` itself went through relative to
+      `agents/challenger.py` (R1.1-R1.3). `scripts/eval_groundedness_gate.py`
+      benchmarks both gates (plus AND/OR ensembles) against the existing
+      27-example `results/narrowing_gate_labeled_audit.jsonl`, per this
+      item's own "measure current gate precision first" instruction —
+      results in `results/r3_1_groundedness_gate_comparison.json`.
+
+      **Real numbers, n=27 (small, and NOT a random sample — curated from
+      documented bug-hunting audits, skewed toward known-hard cases; treat as
+      directional only, not a general accuracy claim for either gate):**
+      ```
+                        TP  FP  TN  FN   acc    prec   recall  f1
+      term-overlap       6  12   9   0  0.556  0.333   1.000  0.500
+      NLI (argmax)       4   6  15   2  0.704  0.400   0.667  0.500
+      ```
+      NLI roughly halves false positives (the dangerous direction — a
+      fabricated/miscited clause silently entering `trusted`) on this hard-
+      case set, at the cost of 2 new false negatives. One of those 2 is a
+      real regression worth flagging honestly: it re-rejects the T1113
+      "single screenshots" clause that term-overlap's own targeted mechanical
+      fixes (own-node-ID exclusion, plural-tolerant matching, punctuation
+      stripping — all already landed in the current `_clause_supported()`)
+      had already fixed. NLI has no visibility into those fixes; it's a
+      different failure mode (terse technical/code-like phrasing vs.
+      general-domain NLI training data), not something inherited from the
+      old gate.
+
+      **AND-ensemble (grounded only if both agree) == NLI alone exactly; OR-
+      ensemble (either agrees) == term-overlap alone exactly**, both to the
+      last decimal — on this data, NLI's "grounded" calls are a strict
+      subset of term-overlap's; it never independently green-lights
+      something term-overlap rejected, only narrows term-overlap's
+      over-permissive calls. So there is no combination benefit found here
+      beyond picking one of the two — a real, checked finding, not an
+      assumption.
+
+      **Not decided**: whether to promote NLI to the live default gate. The
+      FP-vs-FN tradeoff is a real judgment call (a silently-trusted
+      fabrication corrupting graph provenance vs. a wrongly-rejected true
+      claim that just stays an open question, self-correctable on a later
+      round) this file isn't resolving unilaterally — flagging it for a
+      real decision once R3.3 grows the audit set past 27 curated examples,
+      the same threshold-of-evidence this project has applied to its other
+      promotion decisions (R1.1-R1.3).
+
+      **Re-run 2026-09-05 against the grown 47-example audit set (R3.3
+      below) — the conclusion changes, which is exactly why R3.3's caution
+      above mattered, not a formality:**
+      ```
+                        TP  FP  TN  FN   acc    prec   recall  f1
+      term-overlap      23  15   9   0  0.681  0.605   1.000  0.754
+      NLI (argmax)      15   8  16   8  0.660  0.652   0.652  0.652
+      ```
+      At n=27, NLI clearly led on accuracy (0.704 vs 0.556). At n=47, with a
+      more balanced verdict mix (22 good / 24 bad / 1 false_rejection, vs.
+      the original set's heavily bad-skewed 5/21/1), **term-overlap's
+      accuracy and F1 are now slightly ahead** (0.681/0.754 vs
+      0.660/0.652) — the n=27 lead did not hold up. NLI still has a lower
+      false-positive RATE (8/24=0.333 vs 15/24=0.625 — still catches
+      proportionally more fabrications), but at a real, larger recall cost
+      than the small sample suggested (FN 0→8 for NLI vs 0→0 for
+      term-overlap as the set grew). AND/OR ensemble identities (AND==NLI,
+      OR==term-overlap) still hold exactly at the larger n. **Conclusion
+      reinforced, not resolved**: still no clear winner, if anything more
+      clearly a real tradeoff now than at n=27 — this is direct, empirical
+      proof that deciding a promotion from a 27-example curated sample would
+      have been premature, exactly the caution already logged above.
+- [~] R3.2 — **Built 2026-09-05.** `agents.narrowing._answer_addresses_question()`
+      — cosine similarity (nomic-embed-text) between the QUESTION and the
+      ANSWER, orthogonal to groundedness, opt-in (not wired into `answer()`'s
+      live gate). Motivated by the real, already-logged T1055.011
+      `off_topic_but_grounded` case (audit line 14): a fully truthful,
+      source-grounded claim answering a different question than the one
+      attached to it — groundedness alone (either gate) structurally can't
+      catch this since neither ever looks at the question.
+
+      Recovered the actual (question, answer) pair behind that audit line
+      verbatim from `results/narrowing_v3_smoketest.jsonl` (not fabricated —
+      grepped the real run logs for the exact clause text): question asked
+      about privilege escalation / resource access, answer was a real,
+      correctly-cited DEP-bypass fact from elsewhere in the same node's
+      description. Also recovered a same-node, same-underlying-fact
+      **on-topic** pairing from `results/narrowing_pilot_postfix.jsonl` as a
+      positive control (isolates that relevance, not content truth, is what's
+      being measured). Both saved to `results/narrowing_relevance_audit.jsonl`;
+      `scripts/eval_relevance_gate.py` runs the check against them.
+
+      **Real numbers**: off-topic pair cosine=0.6516, on-topic pair
+      cosine=0.9050 — a real, clean separation. Threshold set at 0.78
+      (midpoint), 2/2 correct. **Honest caveat, stated plainly because it
+      matters**: this is an n=2 sanity check on one recovered real case, not
+      a validated benchmark the way R3.1's 27-example groundedness comparison
+      is — there is no labeled relevance dataset yet. Growing one (R3.3)
+      is the natural next step before trusting this threshold generally.
+- [~] R3.3 — **Real progress 2026-09-05: groundedness audit grown 27→47
+      examples**, from `results/narrowing_gate_labeled_audit.jsonl`. Not new
+      Ollama calls — mined 20 already-generated, never-hand-audited
+      `trusted` claims out of `results/narrowing_v5_full.jsonl` (the same
+      already-partially-scrutinized 8-node chain ROADMAP R1.1 references),
+      hand-verified each one against the real, freshly-fetched Neo4j
+      description text for its 6 distinct cited nodes (T1055.011,
+      T1053.005, T1205.002, T1021.005, T1047, T1687). Result: 17/20 good,
+      3/20 bad — 2 new instances of a bug category with only 1 prior
+      confirmed case (`citation_title_treated_as_claim`: a fact named only
+      in a citation's TITLE, never in the source's own prose, asserted as
+      claim content — now 3 confirmed instances total, a real recurring
+      pattern not a one-off) and a 4th `invented_causal_link` instance
+      (flagged as a closer/more borderline call than the prior three, noted
+      honestly in its own entry). Re-running R3.1's comparison against the
+      grown set changed the R3.1 conclusion materially — see R3.1 above,
+      not a redundant re-run. Relevance audit (`results/
+      narrowing_relevance_audit.jsonl`) still at n=2 — growing it needs
+      genuinely fresh narrowing-engine runs (question+answer pairs, not
+      just answers), which existing logs don't have in a mined-for-free
+      form the way the groundedness audit did; still open.
 
 ### R4 — Paper writing `no-GPU` · results-gated (waits on R1→R2)
 - [~] R4.1 — **Drafted file-only 2026-08-17 → `PAPER_DRAFT.md`.** Architecture +

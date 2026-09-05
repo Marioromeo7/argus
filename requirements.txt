@@ -30,6 +30,8 @@ mitreattack-python==3.0.4
 numpy==1.26.4
 pandas==2.2.2
 scikit-learn==1.5.0
+statsmodels==0.14.4  # R2.3: ADF/KPSS stationarity tests on co-evolution series
+ruptures==1.1.9      # R2.3: PELT change-point detection on attack-confidence oscillation
 
 # Dev
 pytest==8.2.2
@@ -43,6 +45,12 @@ beautifulsoup4==4.12.3 # Tool crawler HTML parsing (Kali tools listing)
 # Narrowing engine — clause splitting (CPU-only, not a model call)
 spacy==3.7.5
 # after installing: python -m spacy download en_core_web_sm
+
+# R3.1 — candidate NLI groundedness classifier (agents/narrowing.py
+# _clause_supported_nli, opt-in, not yet the default gate). CPU-only wheel:
+# pip install --index-url https://download.pytorch.org/whl/cpu torch==2.4.1
+torch==2.4.1
+transformers==4.44.2
 
 # GraphRange Scanner additions
 psutil==7.2.2   # telemetry.py CPU/RAM sampling (already present, pinning the

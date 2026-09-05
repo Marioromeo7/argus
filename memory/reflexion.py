@@ -41,14 +41,24 @@ SKIP_LOG            = os.path.join("results", "reflexion_skips.jsonl")
 
 def _think(prompt: str, max_retries: int = 3) -> str:
     """Call Qwen3 in thinking mode; strip <think> blocks from output.
-    Retries on Cloudflare 524 (origin timeout) with exponential backoff."""
+    Retries on Cloudflare 524 (origin timeout), a request timeout, or a
+    dropped connection -- all three real, not hypothetical: the old
+    `timeout=None` ("let Kaggle inference run as long as needed", a Kaggle-era
+    design) meant a genuine local Ollama server hang blocked forever with no
+    retry and no way to distinguish a hang from legitimate slow inference.
+    Confirmed live 2026-09-04/05: a real R2.3 150-cycle run hit this twice in
+    under an hour, once silently for 1+ hour before being caught, once via a
+    ConnectionResetError when Ollama was restarted mid-call, which propagated
+    uncaught and crashed the whole run (see ROADMAP.md R2.3). 900s matches
+    agents/narrowing.py's own documented real-world worst case for a /think
+    call on this hardware (two pilot nodes exceeded 600s outright)."""
     for attempt in range(max_retries):
         try:
             r = requests.post(OLLAMA_CHAT_URL, json={
                 "model": MODEL,
                 "messages": [{"role": "user", "content": f"/think\n\n{prompt}"}],
                 "stream": False,
-            })  # no timeout — let Kaggle inference run as long as needed
+            }, timeout=900)
             r.raise_for_status()
             text = r.json()["message"]["content"]
             return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -56,6 +66,14 @@ def _think(prompt: str, max_retries: int = 3) -> str:
             if e.response.status_code == 524 and attempt < max_retries - 1:
                 wait_time = (2 ** attempt) * 30  # 30s, 60s, 120s
                 print(f"  [RETRY] Cloudflare timeout on attempt {attempt+1}/{max_retries}, waiting {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 30  # 30s, 60s, 120s
+                print(f"  [RETRY] Ollama unresponsive ({type(e).__name__}) on attempt "
+                      f"{attempt+1}/{max_retries}, waiting {wait_time}s...")
                 time.sleep(wait_time)
             else:
                 raise

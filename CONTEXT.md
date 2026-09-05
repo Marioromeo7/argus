@@ -219,10 +219,11 @@ Notable pattern: attack confidence dips to 0.50 at cycles 15–17 and 26 — red
 
 ## Paper Claims (final status)
 
-*Updated 2026-08-24 — see the "R2 Evaluation Results" section above and
-[PAPER_CLAIMS.md](PAPER_CLAIMS.md) for the full evidence.*
+*Updated 2026-09-05 — see the "R2 Evaluation Results" section above and
+[PAPER_CLAIMS.md](PAPER_CLAIMS.md) for the full evidence (PAPER_CLAIMS.md
+itself still needs this same pass, per its own standing note).*
 
-1. **Retrieval precision**: original small pilot GraphRAG P@10=0.083 > VectorRAG P@10=0.000 (6/10 CVEs) still stands; superseded by a real 44-CVE run, GraphRAG P@10=0.176 vs flat VectorRAG 0.039 vs reranked VectorRAG 0.057 — structural traversal outperforms semantic similarity at real scale. ✓ (a 2026-08-23 attempt to scale it via backfilled edges was invalid — circular ground truth — and is excluded)
+1. **Retrieval precision**: original small pilot GraphRAG P@10=0.083 > VectorRAG P@10=0.000 (6/10 CVEs) still stands; superseded by a real 44-CVE run. **Full ranked battery (2026-09-05) refines this**: standard-definition P@10 delta is not statistically significant (bootstrap CI includes zero), but MRR and nDCG@10 deltas are (all 4 CIs clear of zero) — GraphRAG doesn't clearly retrieve more correct top-10 items, but ranks the correct one far higher when found (MRR 0.48 vs 0.17-0.19). ~ (real, significant, but more specific than the original claim — see CONTEXT.md's R2.1 section and ROADMAP.md for the full numbers) (a 2026-08-23 attempt to scale it via backfilled edges was invalid — circular ground truth — and is excluded)
 2. **Grain convergence**: original small pilot 0.30→0.90 over 3 rounds (Δ+0.60) still stands; superseded by a real population-scale sweep of all 73 CVE/technique nodes, 0.300→0.354 (+18.0%), right-shifted distribution — though not uniformly monotonic at the node level (37/73 nodes individually regressed). ✓
 3. **Co-evolutionary dynamics**: agents converge to equilibrium (atk μ=0.82, mit μ=0.91) with strategic oscillation as evidence of genuine adaptation. ✓ (reframed from "p < 0.05 upward trend") — re-verified on a real 100-cycle extension (attack p=0.221, mitigation p=0.134): still equilibrium, not significant, now on 2× the data.
 4. **Hardware feasibility**: full prototype on RTX 3050 4GB VRAM + 16GB RAM. ✓
@@ -339,9 +340,43 @@ Delta (GraphRAG - reranked): +0.119
 GraphRAG beats both VectorRAG variants; reranking measurably helps the
 vector baseline but doesn't close the gap. **[CLAIM SUPPORTED]** at real
 ≥50-CVE scale — this is now the primary retrieval-precision evidence,
-superseding the original 6/10-CVE pilot. Still P@10 only, not the full
-P@k/MRR/nDCG@10/bootstrapped-CI battery `docs/EVALUATION_PLAN.md` #7
-specifies — those need ranked, not set, retrieval results, still open.
+superseding the original 6/10-CVE pilot.
+
+**Full P@k/MRR/nDCG@10/bootstrapped-CI battery completed 2026-09-05
+(`results/r2_1_ranked_battery.json`), same 44-CVE run, real ranked (not set)
+retrieval — a materially more nuanced result than the P@10 number above.**
+The number above uses `tp / len(retrieved)` as its denominator; GraphRAG
+often returns fewer than k candidates (many CVEs have a sparse 1-2 hop
+technique/tactic neighborhood), which shrinks that denominator and inflates
+precision. The standard IR definition (`tp_in_topk / k`, fixed denominator):
+
+```
+                  P@5    P@10   P@20   R@5    R@10   R@20   MRR    nDCG@10
+GraphRAG          0.109  0.055  0.027  0.420  0.420  0.420  0.477  0.433
+VectorRAG(flat)   0.068  0.039  0.026  0.318  0.341  0.455  0.170  0.197
+VectorRAG+Rerank  0.059  0.034  0.025  0.273  0.295  0.432  0.188  0.199
+```
+
+Bootstrapped 95% CI on the **standard P@10 delta** (n=44) **includes zero**
+for both comparisons (GraphRAG−flat CI=[-0.007,+0.039]; GraphRAG−reranked
+CI=[-0.002,+0.043]) — under the fair, fixed-denominator definition, top-10
+set overlap is not statistically distinguishable from VectorRAG at this
+sample size. But **MRR and nDCG@10 deltas are real and significant**, all
+four CIs clear of zero: MRR (GraphRAG−flat) CI=[+0.131,+0.481], MRR
+(GraphRAG−reranked) CI=[+0.107,+0.470], nDCG@10 (GraphRAG−flat)
+CI=[+0.071,+0.402], nDCG@10 (GraphRAG−reranked) CI=[+0.068,+0.403].
+
+**Honest synthesis, this is the claim the paper should actually make**:
+GraphRAG does not clearly retrieve more correct top-10 candidates than
+VectorRAG at this sample size, but when it does find the right technique it
+ranks it far higher (MRR ~0.48 → rank ~2, vs. VectorRAG's MRR ~0.17-0.19 →
+rank ~5-6) — a real, statistically supported, more specific claim than
+"GraphRAG has higher precision." GraphRAG's R@5/R@10/R@20 being identically
+0.420 at every k confirms the sparse-neighborhood explanation directly
+(widening the window finds nothing new); VectorRAG's recall actually
+overtakes GraphRAG's by R@20 (0.455/0.432 vs 0.420) — a real place GraphRAG
+loses, worth stating plainly rather than omitting. Full reconciliation and
+the reranking-variance note in [ROADMAP.md](ROADMAP.md)'s R2.1 entry.
 
 ### R2.2 — Grain convergence: real, population scale (`results/r2_2_grain_73nodes_checkpoint.json`)
 
@@ -425,7 +460,8 @@ open.
 - Phase 3: add Groq as comparison baseline for benchmarking (not yet)
 - ~~Consider running challenger on all 73 CVEs to improve grain distribution before paper submission~~ — done 2026-08-22, see R2.2 above
 - ~~Scale retrieval precision (Claim 1) to a real ≥50-CVE run with ground truth kept independent of the graph~~ — done 2026-08-24, see R2.1 above (44/52 evaluable CVEs)
-- Retrieval precision still needs the full P@k/MRR/nDCG@10/bootstrapped-CI battery beyond the P@10 result already in hand (`docs/EVALUATION_PLAN.md` #7) — needs ranked, not set, retrieval results, a real design change.
-- Co-evolution needs the ≥150-cycle run + stationarity/change-point/cross-correlation battery (ROADMAP.md R2.3) to test the equilibrium hypothesis directly rather than only via a linear-trend p-value.
+- ~~Retrieval precision needs the full P@k/MRR/nDCG@10/bootstrapped-CI battery~~ — done 2026-09-05, see R2.1 above; real, more nuanced result (P@10 delta not significant, MRR/nDCG@10 deltas are).
+- Co-evolution's statistical battery (stationarity/change-point/cross-correlation, ROADMAP.md R2.3) is built and validated against the real 100-cycle data — done 2026-09-05. The ≥150-cycle run itself is still open: an attempt hit a real Ollama server hang mid-run (checkpoint safe at 100, no data lost) — needs Ollama restarted and a `--resume --cycles 150` re-run.
+- R3.1 (NLI groundedness classifier, `agents/narrowing.py`) built and benchmarked against the existing 27-example audit set — done 2026-09-05, not promoted to default (real FP/FN tradeoff, small curated sample — see ROADMAP.md R3.1).
 
 The working directory is `d:\argus`. Run everything with `conda activate argus` first.

@@ -11,19 +11,50 @@ Status key:
 Evidence anchors are the result files summarized in [CONTEXT.md](CONTEXT.md) (raw files live under
 `results/`, which is not committed — the numbers are transcribed into CONTEXT.md).
 
-> **Synced 2026-08-24** (updated same day with the real Claim 1 retrieval
-> result) against direct recomputation from the raw `results/` checkpoint
-> and log files, not from the narrative summary docs
-> (`results/R2_EVALUATION_COMPLETE.md` and siblings) that were written
-> 2026-08-23/24 and turned out to overstate what those files support. See
-> [ROADMAP.md](ROADMAP.md)'s R2 section and [PAPER_DRAFT.md](PAPER_DRAFT.md) §5
-> for the full reconciliation this ledger now matches.
+> **Synced 2026-09-05** against direct recomputation from the raw `results/`
+> checkpoint and log files, not from narrative summary docs. This pass adds:
+> the full ranked-retrieval battery for Claim 1 (Claim 1 downgraded from
+> "Demonstrated" to "Partial" — see below, the standard-definition P@10
+> delta is not significant, though ranking-quality metrics are); the
+> stationarity/change-point/cross-correlation battery for Claim 3 (still
+> Partial, now with a direct equilibrium test, not only an absent trend);
+> and two new entries, Claim 5 (groundedness gate comparison, R3.1) and
+> Claim 6 (hardware-feasibility latency lock-in, R2.4, still open). See
+> [ROADMAP.md](ROADMAP.md)'s R2/R3 sections and [PAPER_DRAFT.md](PAPER_DRAFT.md)
+> §5 for the full reconciliation this ledger now matches.
 
 ---
 
 ## Claim 1 — Retrieval precision: GraphRAG ≥ flat vector RAG
 
-**Status: Demonstrated (44 CVEs, 2026-08-24).**
+**Status: Partial (downgraded from Demonstrated, 2026-09-05).** The P@10
+number below still stands, but the full ranked battery this claim needed
+(P@k/MRR/nDCG@10/bootstrapped CIs, `results/r2_1_ranked_battery.json`) shows
+the standard-definition P@10 delta is **not** statistically significant at
+n=44 (bootstrap 95% CI includes zero for both GraphRAG−flat and
+GraphRAG−reranked). What IS significant: MRR and nDCG@10 deltas, all four
+bootstrap CIs clear of zero (MRR: mean +0.307 CI=[+0.131,+0.481] vs. flat,
+mean +0.290 CI=[+0.107,+0.470] vs. reranked; nDCG@10: mean +0.236
+CI=[+0.071,+0.402] vs. flat, mean +0.234 CI=[+0.068,+0.403] vs. reranked).
+GraphRAG's R@5/R@10/R@20 are identically 0.420 (real: many CVEs have a
+sparse 1-2 hop neighborhood, widening k finds nothing new); VectorRAG's
+recall actually **overtakes** GraphRAG's by R@20 (0.455/0.432 vs 0.420) — a
+place GraphRAG loses, stated plainly. **Correct claim**: GraphRAG does not
+clearly retrieve more correct top-10 candidates than VectorRAG at this
+sample size, but ranks the correct one far higher when found (MRR≈0.48→rank
+~2, vs. VectorRAG's MRR≈0.17-0.19→rank ~5-6). Full numbers:
+
+```
+                  P@5    P@10   P@20   R@5    R@10   R@20   MRR    nDCG@10
+GraphRAG          0.109  0.055  0.027  0.420  0.420  0.420  0.477  0.433
+VectorRAG(flat)   0.068  0.039  0.026  0.318  0.341  0.455  0.170  0.197
+VectorRAG+Rerank  0.059  0.034  0.025  0.273  0.295  0.432  0.188  0.199
+```
+
+Note the old-metric VectorRAG+Rerank number moved between runs (0.057 on
+2026-08-24 → 0.034 on 2026-09-05, same 44-CVE pool) — Qwen3's rerank has no
+fixed seed, real run-to-run LLM variance, not a bug (motivates Claim 1's
+seed-variance follow-up, ROADMAP R2.5, still open).
 
 Original pilot (6/10 CVEs with structured NVD ground truth, 4 pre-CWE-era) —
 result stands, kept as the first evidence:
@@ -142,29 +173,124 @@ not produce significance, which strengthens rather than weakens the
 equilibrium reading.
 
 *Paper framing:* present as mutual optimization under adversarial pressure, not a simple
-improvement trend — now backed by 100 cycles, not 50. Reaching significance via the
-≥150-cycle run + stationarity/change-point/cross-correlation battery is
-[ROADMAP.md](ROADMAP.md) R2.3 work.
+improvement trend — now backed by 100 cycles, not 50.
+
+**Statistical battery built and run against the complete 100-cycle series,
+2026-09-05** (`scripts/eval_coevolution.py`, ADF/KPSS + PELT change-point +
+cross-correlation with a permutation-test p-value). Three real findings:
+(1) **stationarity** — both series jointly confirmed stationary (ADF rejects
+unit root p<0.0001 both; KPSS fails to reject stationarity p>0.05 both) —
+direct, positive equilibrium evidence, not just an absent trend; (2)
+**change-point detection** — using an elbow-selected penalty over a
+pre-registered grid (not a hand-picked constant, which swung the result from
+0 to 19 "changepoints" depending on value), the series resolves to 3
+regime-level segments (cycles 0-25/25-45/45-80/80-100, means
+0.806/0.773/0.879/0.840), not per-dip events — at pen≥2.0, zero
+changepoints found. Honest, non-forced conclusion: individual dips read as
+noise within one regime, not adaptation events; (3) **cross-correlation**
+(red-dip signal vs. mitigation, lags -10..+10) — only lag=0 is significant
+(r=-0.673, permutation p=0.0005, n=2000); no lagged coupling found. The real
+effect is a same-cycle negative association, not "blue strengthens the
+cycle after a red dip" as originally hoped. Reaching the ≥150-cycle target
+is [ROADMAP.md](ROADMAP.md) R2.3 work, in progress at this writing (moved to
+a Kaggle compute lane after repeated local Ollama VRAM/hang issues,
+root-caused to orphaned `llama-server.exe` processes from incomplete
+restarts, not a code bug).
 
 ## Claim 4 — Hardware feasibility on consumer hardware
 
-**Status: Demonstrated.**
+**Status: Demonstrated, latency numbers locked in (2026-09-05).**
 
 The full six-layer prototype runs on an RTX 3050 (4GB VRAM) + 16GB RAM using Qwen3 8B via Ollama.
-Latency is acceptable for batch research use (cold start ~265s; warm calls ~44–130s depending on
-think mode). Suitable for batch experiments, not interactive product use — see limitations.
+`results/r2_4_local_latency.json` — measured with local Ollama genuinely idle (R2.3 had just moved
+to a Kaggle compute lane, confirmed no concurrent local GPU load): warm think-mode 189.0s ± 33.0s
+(n=5), warm fast-mode 12.3s ± 0.3s (n=5), embedding 0.2s ± 0.3s (n=5, CPU-only).
+
+Cold start: attempted twice, honestly unresolved rather than cleanly measured. First attempt's
+`ollama stop` + fixed 2s sleep left the model still loaded (`load_duration=0` proved it). Fixed to
+poll `ollama ps` until genuinely empty before proceeding — but the resulting call's `load_duration`
+*still* read ~0, with wall time (271.5s) inside the observed warm-call range (max 245.2s) rather
+than clearly above it. 271.5s doesn't contradict the earlier ~265s citation, but isn't a cleanly
+re-isolated cold-start number either — reported as-measured with this caveat, not overclaimed.
+
+Suitable for batch experiments, not interactive product use — see limitations.
+
+## Claim 5 — Groundedness gate: term-overlap vs. small NLI classifier (R3.1)
+
+**Status: Partial (built + benchmarked 2026-09-05, not promoted to default;
+re-benchmarked same day on a grown audit set — conclusion changed).**
+
+Benchmarked `agents.narrowing._clause_supported` (term-overlap) against a
+candidate `_clause_supported_nli` (`cross-encoder/nli-deberta-v3-small`,
+~140M, CPU-only, argmax decision, no threshold tuned on the audit data)
+against `results/narrowing_gate_labeled_audit.jsonl`, in two passes:
+
+| Gate | n | TP | FP | TN | FN | Accuracy | Precision | Recall | F1 |
+|---|---|---|---|---|---|---|---|---|---|
+| Term-overlap | 27 | 6 | 12 | 9 | 0 | 0.556 | 0.333 | 1.000 | 0.500 |
+| NLI classifier | 27 | 4 | 6 | 15 | 2 | 0.704 | 0.400 | 0.667 | 0.500 |
+| Term-overlap | 47 | 23 | 15 | 9 | 0 | 0.681 | 0.605 | 1.000 | 0.754 |
+| NLI classifier | 47 | 15 | 8 | 16 | 8 | 0.660 | 0.652 | 0.652 | 0.652 |
+
+First pass (n=27, curated hard-case set: 5 good/21 bad/1 false-rejection):
+NLI led clearly (accuracy 0.704 vs 0.556). **R3.3 then grew the audit to
+n=47** (mined 20 never-audited `trusted` claims from an existing run log,
+`results/narrowing_v5_full.jsonl`, hand-verified each against real Neo4j
+source text — no new Ollama calls) to a more balanced mix (22 good/24
+bad/1 false-rejection), and **the accuracy/F1 lead reversed**: term-overlap
+now edges ahead (0.681/0.754 vs 0.660/0.652). NLI still has a lower FP
+*rate* (0.333 vs 0.625 — still catches proportionally more fabrications)
+but at a larger recall cost than the small sample suggested. AND-ensemble
+== NLI alone exactly; OR-ensemble == term-overlap alone exactly at BOTH
+sample sizes — no combination benefit found either time, NLI's positive
+calls are a strict subset of term-overlap's on this data.
+
+**This reversal is itself the finding worth keeping**: it's direct,
+empirical proof that deciding this gate's default from n=27 would have been
+premature — not a formality, a demonstrated case of a conclusion flipping
+when the (still small, still non-random) sample grew. Still not grounds to
+promote either gate to default; growing the audit set further (R3.3,
+ongoing) remains the concrete prerequisite.
+
+Also found while growing the audit (real, not hypothetical): 2 new
+confirmed instances of `citation_title_treated_as_claim` (a fact named only
+in a citation's TITLE, never in the source's own body prose, asserted as
+claim content) — 3 total confirmed instances now, a real recurring failure
+mode, not the one-off it looked like at n=27.
+
+Separately (R3.2), built `_answer_addresses_question` (embedding cosine
+similarity between question and answer, catching a true-but-off-topic
+answer neither groundedness gate can) — validated against only n=2 real
+recovered examples (one on-topic, one off-topic pair, same underlying fact,
+different questions): 2/2 correct, threshold 0.78 set at the midpoint of
+the two real similarities (0.905 on-topic, 0.652 off-topic). Directional
+only; not a validated benchmark.
 
 ---
 
 ## Known Limitations (state these in the paper)
 
-- All three claims now have real, larger samples (44 CVEs; 73 nodes; 100
-  cycles). Claim 1 (retrieval precision) is still P@10 only, not the full
-  P@k/MRR/nDCG@10/bootstrapped-CI battery the evaluation plan specifies;
-  Claim 3 (co-evolution) still does not reach significance; Claim 2 (grain
-  convergence)'s node-level convergence is not uniformly monotonic. A
-  2026-08-23 attempt to scale Claim 1 to 12 CVEs used a circular methodology
-  and is excluded from all of the above.
+- All three original claims now have real, larger samples (44 CVEs; 73
+  nodes; 100 cycles, 150 in progress). Claim 1 (retrieval precision) now has
+  the full P@k/MRR/nDCG@10/bootstrapped-CI battery — the standard-definition
+  P@10 delta is not significant, though MRR/nDCG@10 deltas are (Claim 1
+  downgraded to Partial accordingly); Claim 3 (co-evolution) still does not
+  reach linear-trend significance, though it's now additionally backed by a
+  direct stationarity test, with the change-point and lagged-coupling
+  sub-findings reported as genuine non-results rather than adjusted to fit;
+  Claim 2 (grain convergence)'s node-level convergence is not uniformly
+  monotonic. A 2026-08-23 attempt to scale Claim 1 to 12 CVEs used a
+  circular methodology and is excluded from all of the above.
+- Neither Claim 5's NLI groundedness classifier (n=27, non-random) nor its
+  relevance check (n=2) has enough labeled data to be conclusive — both are
+  directional findings pending R3.3 growing the audit sets, not decisions.
+- No seed-variance study yet at full evaluation scale for any headline
+  number (local LLM inference is not fully deterministic; pinned versions:
+  `qwen3:8b` Q4_K_M, Ollama 0.32.14, temperature 0.6/top_p 0.95/top_k 20, no
+  explicit seed) — ROADMAP R2.5, still open.
+- Claim 4's latency numbers are now a locked-in, no-concurrent-load local
+  measurement — ROADMAP R2.4, done — though cold-start specifically was not
+  cleanly isolated from warm-call variance (reported honestly, not hidden).
 - Evaluation reporting has a demonstrated failure mode of its own: a
   2026-08-23/24 batch of narrative result summaries overstated what the
   underlying checkpoint/log files actually supported. This ledger reflects

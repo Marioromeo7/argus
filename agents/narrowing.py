@@ -487,6 +487,123 @@ def _clause_supported(clause: str, source_text: str, cited_node_id: str = "",
     return sim >= EVIDENCE_SIMILARITY_THRESHOLD
 
 
+# ── R3.1 candidate: NLI-classifier groundedness check (2026-09-04) ──────────
+# ROADMAP R3.1: term-overlap has a documented, irreducible ceiling -- the
+# labeled audit (results/narrowing_gate_labeled_audit.jsonl) has real, hand-
+# confirmed cases (T1687 "IaaS", T1053.005 "artifacts"/Hide-Artifacts,
+# T1047 "wmic.exe") where a fabricated or miscited term still scores a
+# passing ratio because it happens to appear ANYWHERE in the source or a
+# sibling field, whether or not that's the sentence actually being
+# paraphrased -- overlap is not entailment. This is a candidate replacement,
+# NOT wired into answer()'s live gate -- opt-in, benchmarked against the same
+# audit set by scripts/eval_groundedness_gate.py before any default changes,
+# the same validate-before-promote pattern this module itself went through
+# relative to agents/challenger.py (see ROADMAP R1.1-R1.3).
+NLI_MODEL_NAME = "cross-encoder/nli-deberta-v3-small"  # ~140M params, CPU-only
+_nli_tokenizer = None
+_nli_model = None
+
+
+def _get_nli_model():
+    """Lazy-loaded, module-cached NLI classifier -- same pattern as
+    _get_spacy(). CPU-only (torch installed from the CPU wheel index
+    specifically, per requirements.txt) so this never touches the GPU/VRAM
+    budget Ollama's Qwen3 depends on."""
+    global _nli_tokenizer, _nli_model
+    if _nli_model is None:
+        import torch  # noqa: F401 -- import guard, real use is via the model/tokenizer below
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        _nli_tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL_NAME)
+        _nli_model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL_NAME)
+        _nli_model.eval()
+    return _nli_tokenizer, _nli_model
+
+
+def _clause_supported_nli(clause: str, source_text: str) -> tuple:
+    """
+    Candidate alternative to _clause_supported: source_text is the premise,
+    clause is the hypothesis; grounded iff the model's argmax label is
+    "entailment" (the standard NLI decision rule -- no post-hoc threshold
+    tuned against the audit set, so this number isn't inflated by fitting
+    and evaluating on the same 27 examples). Returns
+    (grounded: bool, entailment_probability: float) -- the probability is
+    exposed for a caller that wants a continuous score instead of the binary
+    cut, and so scripts/eval_groundedness_gate.py can report a threshold
+    sensitivity table without needing a second model pass.
+
+    Does not receive `cited_node_id`/`sibling_text` -- unlike the term-
+    overlap check, an NLI model judges the clause against the ACTUAL cited
+    field's text directly; it has no notion of "this term matched a
+    different field" to hard-veto on. That specific miscitation-detection
+    behavior (the sibling-veto) would need to stay as a separate check
+    layered on top of whichever groundedness mechanism is used, not
+    something this function reproduces on its own.
+    """
+    import torch
+    if not source_text:
+        return False, 0.0
+    tokenizer, model = _get_nli_model()
+    with torch.no_grad():
+        inputs = tokenizer(source_text[:2000], clause, return_tensors="pt", truncation=True)
+        probs = torch.softmax(model(**inputs).logits, dim=-1)[0]
+    labels = model.config.id2label
+    entail_idx = next(i for i, name in labels.items() if name.lower() == "entailment")
+    entail_prob = float(probs[entail_idx])
+    predicted_idx = int(torch.argmax(probs))
+    grounded = labels[predicted_idx].lower() == "entailment"
+    return grounded, entail_prob
+
+
+# ── R3.2 candidate: relevance/answering check (2026-09-05) ──────────────────
+# ROADMAP R3.2: groundedness (_clause_supported / _clause_supported_nli) only
+# checks "is this text true, per the cited source" -- it has no way to catch
+# a fully truthful, well-grounded answer that responds to a DIFFERENT
+# question than the one actually asked. Real, confirmed case:
+# results/narrowing_gate_labeled_audit.jsonl line 14 (T1055.011,
+# off_topic_but_grounded, recovered verbatim from results/
+# narrowing_v3_smoketest.jsonl): asked "how does EWM injection facilitate
+# PRIVILEGE ESCALATION... what resources are accessed," the answerer instead
+# returned a real, source-grounded DEP-bypass fact from elsewhere in the same
+# node's description -- true, cited correctly, and answers nothing about
+# privilege escalation or resource access. Both groundedness gates (term-
+# overlap and the R3.1 NLI classifier) pass this, by design -- neither one
+# ever looks at the question.
+#
+# Embedding-based (cosine similarity between the question and the answer
+# text, nomic-embed-text -- same infra as _clause_supported's embedding
+# fallback), not term-overlap: a genuinely relevant answer often paraphrases
+# the question's topic in different words entirely, so a literal-overlap
+# check would be too brittle for this specific job.
+#
+# Calibration is thin and should be read as such: computed directly (not
+# guessed) from the ONE real audited case above, both its on-topic and
+# off-topic pairing (same node, same underlying DEP-bypass fact, two
+# different questions) --
+#   off-topic pair (question genuinely not addressed): cosine = 0.6516
+#   on-topic pair  (question directly addressed):      cosine = 0.9050
+# 0.78 sits at the midpoint. This is an n=2 sanity check, not a validated
+# threshold -- unlike R3.1's NLI gate (benchmarked against 27 labeled
+# examples), there is no labeled relevance dataset yet. Growing one is R3.3's
+# natural next extension alongside the groundedness audit set, not done here.
+RELEVANCE_SIMILARITY_THRESHOLD = 0.78
+
+
+def _answer_addresses_question(question: str, answer_text: str) -> tuple:
+    """
+    Candidate relevance check, orthogonal to groundedness: does `answer_text`
+    actually respond to `question`. Returns
+    (addresses_question: bool, similarity: float) so a caller can inspect the
+    continuous score instead of just the cut, same pattern as
+    _clause_supported_nli. Not wired into answer()'s live gate -- opt-in,
+    same validate-before-promote posture as R3.1, and honestly thinner on
+    evidence (n=2, not n=27).
+    """
+    if not answer_text:
+        return False, 0.0
+    sim = _cosine(_embed(question), _embed(answer_text))
+    return sim >= RELEVANCE_SIMILARITY_THRESHOLD, sim
+
+
 def _check_provenance(cited_node: dict, field: str) -> bool:
     """ARGUS-LAYER-7: True only if `field` is an original ingested field
     (not agent-added) on a node whose source is nvd or attack."""

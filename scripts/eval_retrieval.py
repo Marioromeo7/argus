@@ -294,6 +294,34 @@ def _graphrag_retrieve(driver, cve_id: str, k: int = 10) -> set[str]:
         return {r["nid"] for r in session.run(cypher, cve=cve_id, k=k)}
 
 
+# R2.1 ranked battery (2026-09-04): P@k/Recall@k for k in {5,10,20}, MRR and
+# nDCG@10 all need an ORDERED ranking, not the unordered set _graphrag_retrieve
+# above returns -- that function is kept as-is (still used for the original
+# P@10/FPR headline metric, unchanged, so the already-published 0.176 number
+# stays reproducible from the same code path). This is a real ranking, not an
+# arbitrary tie-break: for each candidate node, take its best path (fewest
+# hops, then highest path confidence -- path confidence = product of each
+# hop's real RELATION.confidence, a field the graph already populates from
+# agent traversal outcomes, not a placeholder), then order candidates the
+# same way. Verified live against CVE-2000-0148: 1-hop T1134 (conf 0.6) rank
+# ahead of two 2-hop tactics (conf 0.54) -- direct, higher-confidence edges
+# rank first, as a real relevance ordering should.
+def _graphrag_retrieve_ranked(driver, cve_id: str, k: int = 20) -> list[str]:
+    cypher = """
+    MATCH p = (v:Node {node_id: $cve})-[:RELATION*1..2]->(n:Node)
+    WHERE n.node_type IN ['technique', 'tactic']
+    WITH n, length(p) AS hops,
+         reduce(conf = 1.0, r IN relationships(p) | conf * r.confidence) AS path_conf
+    ORDER BY hops ASC, path_conf DESC
+    WITH n.node_id AS nid, collect({hops: hops, conf: path_conf})[0] AS best
+    RETURN nid, best.hops AS hops, best.conf AS conf
+    ORDER BY hops ASC, conf DESC, nid ASC
+    LIMIT $k
+    """
+    with driver.session() as session:
+        return [r["nid"] for r in session.run(cypher, cve=cve_id, k=k)]
+
+
 # R2.1 fix (2026-08-24): found via a live rank-position audit, not assumed --
 # with all 785 nodes (73 vulnerability + 697 technique + 15 tactic) in one
 # undifferentiated searchable index, the correct ground-truth technique
@@ -331,6 +359,23 @@ def _vector_retrieve(col, driver, cve_id: str, k: int = 10) -> set[str]:
     return {i for i in ids if i != cve_id}
 
 
+def _vector_retrieve_ranked(col, driver, cve_id: str, k: int = 20) -> list[str]:
+    """Ranked version of _vector_retrieve -- ChromaDB already returns `ids`
+    ordered nearest-first (ascending cosine distance), so this just preserves
+    that order instead of collapsing it into a set."""
+    from graph.retrieval import get_node
+    node = get_node(driver, cve_id)
+    if not node:
+        return []
+    text    = _node_embed_text(node)
+    emb     = _embed(text)
+    n_query = min(k, max(1, col.count() - 1))
+    results = col.query(query_embeddings=[emb], n_results=n_query,
+                         where=_TECHNIQUE_TYPE_FILTER)
+    ids     = results["ids"][0] if results["ids"] else []
+    return [i for i in ids if i != cve_id]
+
+
 # ── Retrieve-then-rerank (two-stage) ─────────────────────────────────────────
 # Flat embedding nearest-neighbor is genuinely weak at fine-grained relevance
 # among many superficially-similar candidates (measured directly 2026-08-24:
@@ -345,7 +390,8 @@ def _vector_retrieve(col, driver, cve_id: str, k: int = 10) -> set[str]:
 _RERANK_POOL_SIZE = 30  # first-stage width before reranking narrows to k
 
 
-def _rerank_with_qwen(query_text: str, candidates: list[dict], top_k: int) -> list[str] | None:
+def _rerank_with_qwen(query_text: str, candidates: list[dict], top_k: int,
+                       seed: int | None = None) -> list[str] | None:
     """
     Qwen3 fast-mode rerank: given a CVE's text and a candidate pool of
     (id, text) dicts from the first-stage embedding retrieval, ask the model
@@ -353,6 +399,13 @@ def _rerank_with_qwen(query_text: str, candidates: list[dict], top_k: int) -> li
     less to get wrong verbatim). Returns None on any failure (bad response,
     parse failure, timeout) so the caller can fall back to the embedding
     order instead of crashing a long eval run over one bad call.
+
+    `seed`: optional, threaded into Ollama's `options.seed` when set (default
+    None = unset, unchanged production behavior). Added for ROADMAP R2.5
+    (reproducibility) -- Ollama honors `seed` for deterministic sampling,
+    confirmed live 2026-09-05 (identical output for repeated same-seed calls,
+    different output across seeds), enabling scripts/eval_seed_variance.py's
+    real variance-across-seeds check on this rerank step.
     """
     numbered = "\n".join(
         f"{i+1}. [{c['id']}] {c['text'][:280]}"
@@ -369,12 +422,15 @@ def _rerank_with_qwen(query_text: str, candidates: list[dict], top_k: int) -> li
         "No explanation, no other text."
     )
     try:
-        resp = requests.post(config.OLLAMA_CHAT_URL, json={
+        payload = {
             "model": "qwen3:8b",
             "messages": [{"role": "user", "content": prompt}],
             "think": False,   # HTTP "think" field, not a prompt prefix --
             "stream": False,  # /no_think in the prompt body is a documented
-        }, timeout=90)        # no-op for Qwen3 8B (see CONTEXT.md).
+        }                     # no-op for Qwen3 8B (see CONTEXT.md).
+        if seed is not None:
+            payload["options"] = {"seed": seed}
+        resp = requests.post(config.OLLAMA_CHAT_URL, json=payload, timeout=90)
         resp.raise_for_status()
         content = resp.json()["message"]["content"].strip()
         content = re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.M).strip()
@@ -389,17 +445,28 @@ def _rerank_with_qwen(query_text: str, candidates: list[dict], top_k: int) -> li
         return None
 
 
-def _vector_retrieve_reranked(col, driver, cve_id: str, k: int = 10,
-                               pool_size: int = _RERANK_POOL_SIZE) -> set[str]:
+# R2.1 ranked battery (2026-09-04): the ranked metrics need a full ordering up
+# to K_MAX_BATTERY, not just the old top-10. Rather than issue a second Qwen
+# rerank call per CVE (doubling real GPU cost for no reason), the reranked
+# ranking is now computed ONCE per CVE at width K_MAX_BATTERY and the old
+# top-10 set is derived from a slice of that same ordering -- same number of
+# Qwen calls as before, strictly more information returned.
+K_MAX_BATTERY = 20
+
+
+def _vector_retrieve_reranked_ranked(col, driver, cve_id: str, k: int = K_MAX_BATTERY,
+                                      pool_size: int = _RERANK_POOL_SIZE,
+                                      seed: int | None = None) -> list[str]:
     """
     Two-stage vector RAG: retrieve a wider embedding pool, rerank it with
-    Qwen3, return the reranked top-K. Falls back to plain embedding order
-    (i.e. degrades to _vector_retrieve's behavior) if the rerank call fails.
+    Qwen3, return the reranked top-K as an ORDERED list. Falls back to plain
+    embedding order (i.e. degrades to _vector_retrieve's behavior) if the
+    rerank call fails. `seed`: see _rerank_with_qwen's docstring (R2.5).
     """
     from graph.retrieval import get_node
     node = get_node(driver, cve_id)
     if not node:
-        return set()
+        return []
     text    = _node_embed_text(node)
     emb     = _embed(text)
     n_query = min(pool_size, max(1, col.count() - 1))
@@ -409,12 +476,12 @@ def _vector_retrieve_reranked(col, driver, cve_id: str, k: int = 10,
     docs    = results["documents"][0] if results["documents"] else []
     doc_map = dict(zip(results["ids"][0], docs)) if results["ids"] else {}
     if not ids:
-        return set()
+        return []
     candidates = [{"id": i, "text": doc_map.get(i, i)} for i in ids]
-    reranked = _rerank_with_qwen(text, candidates, k)
+    reranked = _rerank_with_qwen(text, candidates, k, seed=seed)
     if reranked:
-        return set(reranked)
-    return set(ids[:k])  # fallback: embedding order, same as the flat baseline
+        return reranked
+    return ids[:k]  # fallback: embedding order, same as the flat baseline
 
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -431,6 +498,82 @@ def _metrics(retrieved: set, ground_truth: set) -> dict:
         "fpr":       fp / len(retrieved),
         "tp": tp, "fp": fp, "fn": fn,
     }
+
+
+# ── R2.1 ranked retrieval battery (2026-09-04) ───────────────────────────────
+# EVALUATION_PLAN.md #7 / ROADMAP R2.1: P@k and Recall@k for k in {5,10,20},
+# MRR, nDCG@10, bootstrap 95% CIs on the GraphRAG-VectorRAG delta. All need a
+# real rank order, not a set -- `_metrics()` above stays untouched (it's what
+# the already-published P@10=0.176/FPR=0.824 headline number is computed
+# from, and that number should stay reproducible from the same code path).
+#
+# Note the denominator difference from `_metrics()`: precision@k here is the
+# standard IR definition (tp_in_topk / k), not tp / len(retrieved) -- the two
+# only coincide when a method actually returns >=k candidates. GraphRAG
+# often returns fewer than k (a real property of the graph: not every CVE has
+# k distinct 1-2 hop technique/tactic neighbors), so its ranked P@10 here is
+# typically LOWER than the len(retrieved)-denominator number already
+# reported -- a fair standard-definition comparison, not a discrepancy.
+_K_VALUES = (5, 10, 20)
+
+
+def _precision_at_k(ranked: list[str], gt: set[str], k: int) -> float:
+    tp = len(set(ranked[:k]) & gt)
+    return tp / k
+
+
+def _recall_at_k(ranked: list[str], gt: set[str], k: int) -> float:
+    if not gt:
+        return 0.0
+    tp = len(set(ranked[:k]) & gt)
+    return tp / len(gt)
+
+
+def _reciprocal_rank(ranked: list[str], gt: set[str]) -> float:
+    for i, nid in enumerate(ranked, 1):
+        if nid in gt:
+            return 1.0 / i
+    return 0.0
+
+
+def _ndcg_at_k(ranked: list[str], gt: set[str], k: int) -> float:
+    """Binary-relevance nDCG@k. IDCG uses min(len(gt), k) -- the most
+    relevant items an ideal ranker could stack into the top k."""
+    dcg = sum(1.0 / np.log2(i + 1) for i, nid in enumerate(ranked[:k], 1) if nid in gt)
+    ideal_hits = min(len(gt), k)
+    idcg = sum(1.0 / np.log2(i + 1) for i in range(1, ideal_hits + 1))
+    return dcg / idcg if idcg > 0 else 0.0
+
+
+def _battery_row(ranked: list[str], gt: set[str]) -> dict:
+    row = {"mrr": _reciprocal_rank(ranked, gt), "ndcg10": _ndcg_at_k(ranked, gt, 10)}
+    for kk in _K_VALUES:
+        row[f"p@{kk}"] = _precision_at_k(ranked, gt, kk)
+        row[f"r@{kk}"] = _recall_at_k(ranked, gt, kk)
+    return row
+
+
+def _agg_battery(rows: list[dict]) -> dict:
+    if not rows:
+        return {}
+    return {key: float(np.mean([r[key] for r in rows])) for key in rows[0]}
+
+
+def _bootstrap_ci(deltas: list[float], n_boot: int = 10000, alpha: float = 0.05,
+                   seed: int = 42) -> dict:
+    """Percentile bootstrap 95% CI on the mean of `deltas` (per-CVE
+    GraphRAG - VectorRAG P@10 differences). Resamples CVEs with replacement,
+    not individual retrieved items -- the CVE is the unit of measurement."""
+    arr = np.asarray(deltas, dtype=float)
+    n = len(arr)
+    if n == 0:
+        return {"mean": 0.0, "ci_low": 0.0, "ci_high": 0.0, "n_boot": n_boot, "n": 0}
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, size=(n_boot, n))
+    boot_means = arr[idx].mean(axis=1)
+    lo, hi = np.percentile(boot_means, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return {"mean": float(arr.mean()), "ci_low": float(lo), "ci_high": float(hi),
+            "n_boot": n_boot, "n": n}
 
 
 # ── Main eval ─────────────────────────────────────────────────────────────────
@@ -502,6 +645,7 @@ def run_eval(k: int = 10, n_cves: int = 10, rerank: bool = True,
 
     graphrag_scores, vector_scores, rerank_scores = [], [], []
     retrieved_map: dict[str, dict] = {}
+    ranked_battery: dict[str, list[dict]] = {"GraphRAG": [], "VectorRAG": [], "VectorRAG+Rerank": []}
     methods = ["GraphRAG", "VectorRAG"] + (["VectorRAG+Rerank"] if rerank else [])
     header = (f"\n{'CVE':<22} {'GT':>4} {'Method':<18} "
               f"{'P@K':>6} {'Recall':>8} {'FPR':>7} {'TP/FP/FN'}")
@@ -509,21 +653,30 @@ def run_eval(k: int = 10, n_cves: int = 10, rerank: bool = True,
     print("-" * 80)
 
     for i, (cve_id, gt) in enumerate(evaluable.items(), 1):
-        g_ret = _graphrag_retrieve(driver, cve_id, k=k)
-        v_ret = _vector_retrieve(col, driver, cve_id, k=k)
+        # Single ranked call per method per CVE, width K_MAX_BATTERY (20) --
+        # the old top-k set (for the unchanged _metrics() headline number)
+        # is sliced from the same ranking rather than issuing a second call.
+        g_ranked = _graphrag_retrieve_ranked(driver, cve_id, k=K_MAX_BATTERY)
+        v_ranked = _vector_retrieve_ranked(col, driver, cve_id, k=K_MAX_BATTERY)
+        g_ret = set(g_ranked[:k])
+        v_ret = set(v_ranked[:k])
         entry = {"graphrag": g_ret, "vector": v_ret}
         g_m   = _metrics(g_ret, gt)
         v_m   = _metrics(v_ret, gt)
         graphrag_scores.append(g_m)
         vector_scores.append(v_m)
         rows = [("GraphRAG", g_m), ("VectorRAG", v_m)]
+        ranked_battery["GraphRAG"].append(_battery_row(g_ranked, gt))
+        ranked_battery["VectorRAG"].append(_battery_row(v_ranked, gt))
 
         if rerank:
-            r_ret = _vector_retrieve_reranked(col, driver, cve_id, k=k, pool_size=rerank_pool)
+            r_ranked = _vector_retrieve_reranked_ranked(col, driver, cve_id, k=K_MAX_BATTERY, pool_size=rerank_pool)
+            r_ret = set(r_ranked[:k])
             entry["vector_reranked"] = r_ret
             r_m = _metrics(r_ret, gt)
             rerank_scores.append(r_m)
             rows.append(("VectorRAG+Rerank", r_m))
+            ranked_battery["VectorRAG+Rerank"].append(_battery_row(r_ranked, gt))
 
         retrieved_map[cve_id] = entry
         for label, m in rows:
@@ -569,6 +722,43 @@ def run_eval(k: int = 10, n_cves: int = 10, rerank: bool = True,
             print("  [NOTE] Reranking closed the gap to GraphRAG on this sample")
     print("=" * 75)
 
+    # ── R2.1 ranked battery summary ─────────────────────────────────────────
+    battery_summary = {m: _agg_battery(rows) for m, rows in ranked_battery.items() if rows}
+
+    p10_deltas_flat = [g["p@10"] - v["p@10"]
+                        for g, v in zip(ranked_battery["GraphRAG"], ranked_battery["VectorRAG"])]
+    ci_flat = _bootstrap_ci(p10_deltas_flat)
+    ci_reranked = None
+    if rerank and ranked_battery["VectorRAG+Rerank"]:
+        p10_deltas_rerank = [g["p@10"] - r["p@10"]
+                              for g, r in zip(ranked_battery["GraphRAG"], ranked_battery["VectorRAG+Rerank"])]
+        ci_reranked = _bootstrap_ci(p10_deltas_rerank)
+
+    def _excludes_zero(ci: dict) -> str:
+        return "[CI excludes 0]" if (ci["ci_low"] > 0 or ci["ci_high"] < 0) else "[CI includes 0]"
+
+    print("\n" + "=" * 75)
+    print("RANKED RETRIEVAL BATTERY (standard P@k=tp_in_topk/k, R@k=tp_in_topk/|GT|)")
+    print(f"  {'Method':<18} {'P@5':>6} {'P@10':>6} {'P@20':>6} "
+          f"{'R@5':>6} {'R@10':>6} {'R@20':>6} {'MRR':>6} {'nDCG@10':>8}")
+    for method in ["GraphRAG", "VectorRAG", "VectorRAG+Rerank"]:
+        s = battery_summary.get(method)
+        if not s:
+            continue
+        print(f"  {method:<18} {s['p@5']:>6.3f} {s['p@10']:>6.3f} {s['p@20']:>6.3f} "
+              f"{s['r@5']:>6.3f} {s['r@10']:>6.3f} {s['r@20']:>6.3f} "
+              f"{s['mrr']:>6.3f} {s['ndcg10']:>8.3f}")
+    print(f"\n  Bootstrap 95% CI, P@10 delta (GraphRAG - VectorRAG flat), n={ci_flat['n']}, "
+          f"n_boot={ci_flat['n_boot']}:")
+    print(f"    mean={ci_flat['mean']:+.3f}  CI=[{ci_flat['ci_low']:+.3f}, {ci_flat['ci_high']:+.3f}]  "
+          f"{_excludes_zero(ci_flat)}")
+    if ci_reranked:
+        print(f"  Bootstrap 95% CI, P@10 delta (GraphRAG - VectorRAG+Rerank), n={ci_reranked['n']}, "
+              f"n_boot={ci_reranked['n_boot']}:")
+        print(f"    mean={ci_reranked['mean']:+.3f}  CI=[{ci_reranked['ci_low']:+.3f}, "
+              f"{ci_reranked['ci_high']:+.3f}]  {_excludes_zero(ci_reranked)}")
+    print("=" * 75)
+
     result = {
         "ground_truth_source": "NVD CWE + reference URLs + keyword extraction",
         "evaluable_cves":      len(evaluable),
@@ -592,6 +782,24 @@ def run_eval(k: int = 10, n_cves: int = 10, rerank: bool = True,
                 "vector_reranked_retrieved": sorted(retrieved_map[cve_id].get("vector_reranked", [])),
             }
             for cve_id, gt in evaluable.items()
+        },
+        # R2.1 ranked battery (2026-09-04): P@k/R@k (k in {5,10,20}), MRR,
+        # nDCG@10, bootstrapped 95% CI on the P@10 delta. Uses the standard
+        # IR precision@k definition (tp_in_topk / k), NOT the tp/len(retrieved)
+        # denominator the fields above use -- see _precision_at_k's docstring.
+        "ranked_battery_k_values":    list(_K_VALUES),
+        "ranked_battery_summary":     battery_summary,
+        "ranked_battery_bootstrap_ci": {
+            "graphrag_minus_vectorrag_flat":     ci_flat,
+            "graphrag_minus_vectorrag_reranked": ci_reranked,
+        },
+        "per_cve_ranked": {
+            cve_id: {
+                "graphrag":         ranked_battery["GraphRAG"][idx],
+                "vector":           ranked_battery["VectorRAG"][idx],
+                "vector_reranked":  ranked_battery["VectorRAG+Rerank"][idx] if rerank else None,
+            }
+            for idx, cve_id in enumerate(evaluable.keys())
         },
     }
     return result
